@@ -479,9 +479,7 @@ class TestEnableVllmBenchmarkMode:
             }
         }
         enable_vllm_benchmark_mode(cfg)
-        env = cfg["spec"]["services"]["decode"]["extraPodSpec"][
-            "mainContainer"
-        ]["env"]
+        env = cfg["spec"]["services"]["decode"]["extraPodSpec"]["mainContainer"]["env"]
         names = [e["name"] for e in env]
         assert names.count("DYN_BENCHMARK_MODE") == 1
         assert _benchmark_mode(cfg["spec"]["services"]["decode"]) == "decode"
@@ -518,11 +516,7 @@ class TestEnableVllmBenchmarkMode:
             }
         }
         enable_vllm_benchmark_mode(cfg)
-        mc = cfg["spec"]["services"]["prefill"]["extraPodSpec"][
-            "mainContainer"
-        ]
+        mc = cfg["spec"]["services"]["prefill"]["extraPodSpec"]["mainContainer"]
         assert mc["image"] == "nvcr.io/foo:1.0"
         assert mc["args"] == ["--model-path", "x"]
-        assert (
-            _benchmark_mode(cfg["spec"]["services"]["prefill"]) == "prefill"
-        )
+        assert _benchmark_mode(cfg["spec"]["services"]["prefill"]) == "prefill"

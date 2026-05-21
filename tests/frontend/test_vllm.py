@@ -69,7 +69,7 @@ SYSTEM_HEALTH_TOOL = {
 }
 
 
-class workerProcess(ManagedProcess):
+class WorkerProcess(ManagedProcess):
     """Vllm Worker process for GPT-OSS model."""
 
     def __init__(
@@ -204,7 +204,7 @@ def start_services(
         terminate_all_matching_process_names=False,
     ):
         logger.info("Frontend started for tests")
-        with workerProcess(
+        with WorkerProcess(
             request,
             frontend_port=frontend_port,
             system_port=system_port,
@@ -234,9 +234,9 @@ def _extract_reasoning_metrics(data: Dict[str, Any]) -> Tuple[str, Optional[int]
 
 def _validate_chat_response(response: requests.Response) -> Dict[str, Any]:
     """Ensure the chat completion response is well-formed and return its payload."""
-    assert (
-        response.status_code == 200
-    ), f"Chat request failed with status {response.status_code}: {response.text}"
+    assert response.status_code == 200, (
+        f"Chat request failed with status {response.status_code}: {response.text}"
+    )
     response_json = response.json()
     if "choices" not in response_json:
         raise AssertionError(f"Chat response missing 'choices': {response_json}")
@@ -427,7 +427,9 @@ def test_tool_calling_second_round(
     assert "20" in content and any(
         temp_word in content.lower()
         for temp_word in ["celsius", "temperature", "degrees", "°c", "20°"]
-    ), "Expected response to include temperature information from tool call result (20°C)"
+    ), (
+        "Expected response to include temperature information from tool call result (20°C)"
+    )
 
 
 # Measured using: tests/utils/profile_pytest.py tests/frontend/test_vllm.py::test_reasoning
@@ -468,6 +470,6 @@ def test_reasoning(request, start_services: ServicePorts, predownload_models) ->
     content = message.get("content", "").strip()
 
     assert content, "Expected model to generate a response with content"
-    assert any(
-        char.isdigit() for char in content
-    ), "Expected response to contain numerical calculations"
+    assert any(char.isdigit() for char in content), (
+        "Expected response to contain numerical calculations"
+    )
