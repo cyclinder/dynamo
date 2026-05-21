@@ -330,7 +330,7 @@ def test_apply_dgd_overrides_extrapodspec_tolerations() -> None:
     dgd_config = {
         "spec": {
             "services": {
-                "VllmDecodeWorker": {
+                "decode": {
                     "componentType": "worker",
                     "extraPodSpec": {
                         "mainContainer": {
@@ -352,7 +352,7 @@ def test_apply_dgd_overrides_extrapodspec_tolerations() -> None:
         "metadata": {"name": "placeholder"},
         "spec": {
             "services": {
-                "VllmDecodeWorker": {"extraPodSpec": {"tolerations": [toleration]}},
+                "decode": {"extraPodSpec": {"tolerations": [toleration]}},
                 "Frontend": {"extraPodSpec": {"tolerations": [toleration]}},
             }
         },
@@ -361,7 +361,7 @@ def test_apply_dgd_overrides_extrapodspec_tolerations() -> None:
     result = apply_dgd_overrides(dgd_config, overrides)
 
     # Tolerations must be present on both services.
-    decode_eps = result["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"]
+    decode_eps = result["spec"]["services"]["decode"]["extraPodSpec"]
     assert decode_eps["tolerations"] == [toleration]
     # mainContainer must be preserved (not overwritten).
     assert decode_eps["mainContainer"]["image"] == "my-image"
@@ -372,7 +372,7 @@ def test_apply_dgd_overrides_extrapodspec_tolerations() -> None:
     # Original must not be mutated.
     assert (
         "tolerations"
-        not in dgd_config["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"]
+        not in dgd_config["spec"]["services"]["decode"]["extraPodSpec"]
     )
 
 
@@ -419,7 +419,7 @@ _TOLERATION = {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSched
 _BASE_DGD = {
     "spec": {
         "services": {
-            "VllmDecodeWorker": {
+            "decode": {
                 "extraPodSpec": {
                     "mainContainer": {"image": "my-image", "args": ["--model", "m"]},
                 },
@@ -433,7 +433,7 @@ _BASE_DGD = {
 _OVERRIDE_DGD = {
     "spec": {
         "services": {
-            "VllmDecodeWorker": {"extraPodSpec": {"tolerations": [_TOLERATION]}},
+            "decode": {"extraPodSpec": {"tolerations": [_TOLERATION]}},
             "GhostService": {"extraPodSpec": {"tolerations": [_TOLERATION]}},
         }
     }
@@ -532,8 +532,8 @@ async def test_run_profile_applies_dgd_overrides_before_interpolation(
     assert interpolation_kwargs, "run_interpolation was never called"
     disagg_config = interpolation_kwargs["disagg_config"]
 
-    # Tolerations must be present on VllmDecodeWorker before interpolation.
-    eps = disagg_config["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"]
+    # Tolerations must be present on decode before interpolation.
+    eps = disagg_config["spec"]["services"]["decode"]["extraPodSpec"]
     assert eps["tolerations"] == [_TOLERATION]
 
     # mainContainer must be preserved (not overwritten by the tolerations merge).
@@ -551,7 +551,7 @@ async def test_run_profile_applies_dgd_overrides_before_interpolation(
     # apply_dgd_overrides must not mutate its input.
     assert (
         "tolerations"
-        not in base_dgd["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"]
+        not in base_dgd["spec"]["services"]["decode"]["extraPodSpec"]
     )
 
 

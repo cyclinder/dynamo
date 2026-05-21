@@ -253,7 +253,7 @@ metadata:
   name: my-deployment
 spec:
   services:
-    VllmWorker:
+    worker:
       componentType: worker
       replicas: 2
       # Health checks automatically enabled by operator

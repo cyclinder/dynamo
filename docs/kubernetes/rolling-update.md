@@ -27,7 +27,7 @@ spec:
       extraPodSpec:
         mainContainer:
           image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
-    VllmDecodeWorker:
+    decode:
       componentType: worker
       replicas: 1
       extraPodSpec:
@@ -42,7 +42,7 @@ spec:
             - Qwen/Qwen3-0.6B
             - --disaggregation-mode
             - decode
-    VllmPrefillWorker:
+    prefill:
       componentType: worker
       subComponentType: prefill
       replicas: 1
@@ -75,7 +75,7 @@ spec:
       extraPodSpec:
         mainContainer:
           image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
-    VllmDecodeWorker:
+    decode:
       componentType: worker
       replicas: 1
       extraPodSpec:
@@ -92,7 +92,7 @@ spec:
             - decode
             - --tensor-parallelism
             - "2"
-    VllmPrefillWorker:
+    prefill:
       componentType: worker
       subComponentType: prefill
       replicas: 1
@@ -137,7 +137,7 @@ The following diagram illustrates the rolling update of the decode worker in a G
 ```
 ┌─ PodCliqueSet: vllm-disagg ───────────────────────────────────────────────────────┐
 │                                                                                    │
-│  ┌─ PCLQ: Frontend ──────┐  ┌─ PCLQ: VllmPrefillWorker ─┐                        │
+│  ┌─ PCLQ: Frontend ──────┐  ┌─ PCLQ: prefill ─┐                        │
 │  │                        │  │                            │                        │
 │  │  ┌──────────────────┐  │  │  ┌──────────────────────┐  │                        │
 │  │  │ Pod (v1) ✓       │  │  │  │ Pod (v1) ✓           │  │   No changes —        │
@@ -145,7 +145,7 @@ The following diagram illustrates the rolling update of the decode worker in a G
 │  │                        │  │                            │                        │
 │  └────────────────────────┘  └────────────────────────────┘                        │
 │                                                                                    │
-│  ┌─ PCLQ: VllmDecodeWorker ──────────────────────────────────────────────────────┐ │
+│  ┌─ PCLQ: decode ──────────────────────────────────────────────────────┐ │
 │  │                                                                                │ │
 │  │  maxUnavailable: 1, maxSurge: 0                                                │ │
 │  │                                                                                │ │
@@ -202,7 +202,7 @@ For DGDs backed by Kubernetes **Deployments** (single-node, non-multinode servic
 │                                                                                    │
 │  ┌─ OLD DCDs (hash: a1b2c3d4) ──────────────────────────────────────────────────┐  │
 │  │                                                                               │  │
-│  │  ┌─ DCD: VllmDecodeWorker-a1b2c3d4 ──┐  ┌─ DCD: VllmPrefillWorker-a1b2c3d4 ┐│  │
+│  │  ┌─ DCD: decode-a1b2c3d4 ──┐  ┌─ DCD: prefill-a1b2c3d4 ┐│  │
 │  │  │                                    │  │                                   ││  │
 │  │  │  ┌──────────────────────┐          │  │  ┌─────────────────────┐          ││  │
 │  │  │  │ Pod (v1) Terminating │          │  │  │ Pod (v1) Terminating│          ││  │
@@ -216,7 +216,7 @@ For DGDs backed by Kubernetes **Deployments** (single-node, non-multinode servic
 │                                                                                    │
 │  ┌─ NEW DCDs (hash: f5e6d7c8) ──────────────────────────────────────────────────┐  │
 │  │                                                                               │  │
-│  │  ┌─ DCD: VllmDecodeWorker-f5e6d7c8 ──┐  ┌─ DCD: VllmPrefillWorker-f5e6d7c8 ┐│  │
+│  │  ┌─ DCD: decode-f5e6d7c8 ──┐  ┌─ DCD: prefill-f5e6d7c8 ┐│  │
 │  │  │                                    │  │                                   ││  │
 │  │  │  ┌──────────────────────┐          │  │  ┌─────────────────────┐          ││  │
 │  │  │  │ Pod (v2) ✓ NEW      │          │  │  │ Pod (v2) ✓ NEW     │          ││  │
@@ -266,7 +266,7 @@ Values can be absolute integers (e.g., `"1"`, `"2"`) or percentages (e.g., `"25%
 **Example** — zero-downtime update with surge capacity:
 
 ```yaml
-VllmPrefillWorker:
+prefill:
   componentType: worker
   subComponentType: prefill
   replicas: 4
@@ -280,7 +280,7 @@ This ensures that all 4 existing prefill replicas remain available while 1 new r
 **Example** — fast update allowing temporary capacity reduction:
 
 ```yaml
-VllmDecodeWorker:
+decode:
   componentType: worker
   subComponentType: decode
   replicas: 8

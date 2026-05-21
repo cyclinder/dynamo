@@ -51,7 +51,7 @@ spec:
     topologyProfile: my-cluster-topology
     packDomain: zone
   services:
-    VllmWorker:
+    worker:
       componentType: worker
       replicas: 2
       envFromSecret: hf-token-secret
@@ -88,7 +88,7 @@ spec:
   topologyConstraint:
     topologyProfile: my-cluster-topology
   services:
-    VllmWorker:
+    worker:
       componentType: worker
       replicas: 2
       multinode:
@@ -130,7 +130,7 @@ spec:
     topologyProfile: my-cluster-topology
     packDomain: zone
   services:
-    VllmWorker:
+    worker:
       componentType: worker
       replicas: 2
       multinode:
@@ -190,7 +190,7 @@ For multinode services (services with a `multinode` section), the topology const
 For example, with this configuration:
 
 ```yaml
-VllmWorker:
+worker:
   replicas: 2
   multinode:
     nodeCount: 4

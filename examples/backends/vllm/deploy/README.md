@@ -45,13 +45,13 @@ Hardware-specific aggregated/disaggregated deployment using Kubernetes Dynamic R
 
 **Aggregated Architecture:**
 - `Frontend`: OpenAI-compatible API server
-- `VllmDecodeWorker`: Single worker with XPU target (`VLLM_TARGET_DEVICE=xpu`)
+- `decode`: Single worker with XPU target (`VLLM_TARGET_DEVICE=xpu`)
 - GPU allocation via `ResourceClaimTemplate` and pod-level `resourceClaims`
 
 **Disaggregated Architecture:**
 - `Frontend`: HTTP API server coordinating between workers
-- `VllmDecodeWorker`: Specialized decode-only worker with XPU target
-- `VllmPrefillWorker`: Specialized prefill-only worker with XPU target
+- `decode`: Specialized decode-only worker with XPU target
+- `prefill`: Specialized prefill-only worker with XPU target
 - GPU allocation via `ResourceClaimTemplate` and pod-level `resourceClaims`
 - Communication via NIXL transfer backend with XPU buffer
 

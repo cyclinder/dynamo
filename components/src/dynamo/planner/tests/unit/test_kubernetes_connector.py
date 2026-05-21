@@ -1044,8 +1044,8 @@ def test_get_actual_worker_counts_no_components(kubernetes_connector, mock_kube_
 #
 # Regression: the filter that compares an MDC entry's ``component`` field
 # against ``expected_component`` must use the lowercase backend-default
-# name (what the Rust runtime writes to MDC), NOT the DGD component name.
-# The DGD component name is typically PascalCase (``VllmPrefillWorker``)
+# name (what the Rust runtime writes to MDC), NOT the DGD ``spec.services``
+# dict key. The DGD key is typically PascalCase (``prefill``)
 # while MDC carries the Endpoint name (``prefill`` / ``backend``);
 # returning the DGD component name for the filter would cause every real-world MDC
 # entry to be skipped, leaving WorkerInfo without ``context_length`` and
@@ -1077,9 +1077,8 @@ def test_resolve_dgd_service_v1beta_endpoint_override(
     mock_deployment = {
         "metadata": {"name": "test-graph"},
         "spec": {
-            "components": [
-                {
-                    "name": "VllmPrefillWorker",
+            "services": {
+                "prefill": {
                     "replicas": 1,
                     "type": "prefill",
                     "podTemplate": {
@@ -1098,7 +1097,7 @@ def test_resolve_dgd_service_v1beta_endpoint_override(
                         }
                     },
                 },
-            ]
+            }
         },
     }
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
@@ -1107,22 +1106,34 @@ def test_resolve_dgd_service_v1beta_endpoint_override(
         SubComponentType.PREFILL, backend="vllm"
     )
 
-    assert dgd_service_name == "VllmPrefillWorker"
-    assert expected_component == "my-custom-prefill"
+    # k8s operations (e.g. replica patch) still target the PascalCase DGD key.
+    assert dgd_service_name == "prefill"
+    # The filter side must match what the Rust runtime writes to MDC.
+    assert expected_component == "prefill"
 
 
 def test_resolve_dgd_service_decode_uses_backend_default_for_filter(
     kubernetes_connector, mock_kube_api
 ):
     """vLLM decode: MDC carries "backend", NOT "decode"; filter must match that."""
-    mock_deployment = _deployment(_component("VllmDecodeWorker", "decode", replicas=1))
+    mock_deployment = {
+        "metadata": {"name": "test-graph"},
+        "spec": {
+            "services": {
+                "decode": {
+                    "replicas": 1,
+                    "subComponentType": "decode",
+                },
+            }
+        },
+    }
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     dgd_service_name, expected_component = kubernetes_connector._resolve_dgd_service(
         SubComponentType.DECODE, backend="vllm"
     )
 
-    assert dgd_service_name == "VllmDecodeWorker"
+    assert dgd_service_name == "decode"
     # Critically, vLLM's decode-worker component name is "backend" (from
     # VllmComponentName.decode_worker_component_name). Using
     # SubComponentType.DECODE.value ("decode") here would break decode
@@ -1166,27 +1177,35 @@ def test_resolve_dgd_service_respects_user_endpoint_override(
     kubernetes_connector, mock_kube_api
 ):
     """If the DGD passes --endpoint ns.comp.ep, the MDC filter must use 'comp'."""
-    mock_deployment = _deployment(
-        _component(
-            "VllmPrefillWorker",
-            "prefill",
-            replicas=1,
-            args=[
-                "--endpoint",
-                "my-ns.my-custom-prefill.generate",
-                "--model",
-                "Qwen/Qwen3-8B",
-            ],
-        )
-    )
+    mock_deployment = {
+        "metadata": {"name": "test-graph"},
+        "spec": {
+            "services": {
+                "prefill": {
+                    "replicas": 1,
+                    "subComponentType": "prefill",
+                    "extraPodSpec": {
+                        "mainContainer": {
+                            "args": [
+                                "--endpoint",
+                                "my-ns.my-custom-prefill.generate",
+                                "--model",
+                                "Qwen/Qwen3-8B",
+                            ]
+                        }
+                    },
+                },
+            }
+        },
+    }
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     dgd_service_name, expected_component = kubernetes_connector._resolve_dgd_service(
         SubComponentType.PREFILL, backend="vllm"
     )
 
-    # k8s operations still target the DGD component name.
-    assert dgd_service_name == "VllmPrefillWorker"
+    # k8s operations still target the DGD services key.
+    assert dgd_service_name == "prefill"
     # Filter must match what the worker will actually write to MDC, which
     # comes from the user's --endpoint override, not the backend default.
     assert expected_component == "my-custom-prefill"
@@ -1196,17 +1215,25 @@ def test_resolve_dgd_service_endpoint_override_with_dyn_prefix(
     kubernetes_connector, mock_kube_api
 ):
     """parse_endpoint accepts 'dyn://' prefix; the extracted component must strip it."""
-    mock_deployment = _deployment(
-        _component(
-            "VllmDecodeWorker",
-            "decode",
-            replicas=1,
-            args=[
-                "--endpoint",
-                "dyn://ns.user-decode.generate",
-            ],
-        )
-    )
+    mock_deployment = {
+        "metadata": {"name": "test-graph"},
+        "spec": {
+            "services": {
+                "decode": {
+                    "replicas": 1,
+                    "subComponentType": "decode",
+                    "extraPodSpec": {
+                        "mainContainer": {
+                            "args": [
+                                "--endpoint",
+                                "dyn://ns.user-decode.generate",
+                            ]
+                        }
+                    },
+                },
+            }
+        },
+    }
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     _, expected_component = kubernetes_connector._resolve_dgd_service(
@@ -1220,14 +1247,22 @@ def test_resolve_dgd_service_malformed_endpoint_falls_back_to_default(
     kubernetes_connector, mock_kube_api
 ):
     """Malformed --endpoint (wrong number of parts) falls back to backend default."""
-    mock_deployment = _deployment(
-        _component(
-            "VllmPrefillWorker",
-            "prefill",
-            replicas=1,
-            args=["--endpoint", "only-two.parts"],
-        )
-    )
+    mock_deployment = {
+        "metadata": {"name": "test-graph"},
+        "spec": {
+            "services": {
+                "prefill": {
+                    "replicas": 1,
+                    "subComponentType": "prefill",
+                    "extraPodSpec": {
+                        "mainContainer": {
+                            "args": ["--endpoint", "only-two.parts"],
+                        }
+                    },
+                },
+            }
+        },
+    }
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     _, expected_component = kubernetes_connector._resolve_dgd_service(
@@ -1239,27 +1274,33 @@ def test_resolve_dgd_service_malformed_endpoint_falls_back_to_default(
 
 def test_service_get_component_name_from_endpoint_arg_present():
     service = Service(
-        name="VllmPrefillWorker",
-        service=_component(
-            "VllmPrefillWorker",
-            args=[
-                "--endpoint",
-                "ns.custom-comp.generate",
-                "--other",
-                "flag",
-            ],
-        ),
+        name="prefill",
+        service={
+            "extraPodSpec": {
+                "mainContainer": {
+                    "args": [
+                        "--endpoint",
+                        "ns.custom-comp.generate",
+                        "--other",
+                        "flag",
+                    ]
+                }
+            }
+        },
     )
     assert service.get_component_name_from_endpoint_arg() == "custom-comp"
 
 
 def test_service_get_component_name_from_endpoint_arg_absent():
     service = Service(
-        name="VllmPrefillWorker",
-        service=_component(
-            "VllmPrefillWorker",
-            args=["--model", "Qwen/Qwen3-8B"],
-        ),
+        name="prefill",
+        service={
+            "extraPodSpec": {
+                "mainContainer": {
+                    "args": ["--model", "Qwen/Qwen3-8B"],
+                }
+            }
+        },
     )
     assert service.get_component_name_from_endpoint_arg() is None
 
@@ -1267,7 +1308,7 @@ def test_service_get_component_name_from_endpoint_arg_absent():
 def test_service_get_component_name_from_endpoint_arg_missing_value():
     """--endpoint with no following arg should return None, not raise IndexError."""
     service = Service(
-        name="VllmPrefillWorker",
-        service=_component("VllmPrefillWorker", args=["--endpoint"]),
+        name="prefill",
+        service={"extraPodSpec": {"mainContainer": {"args": ["--endpoint"]}}},
     )
     assert service.get_component_name_from_endpoint_arg() is None

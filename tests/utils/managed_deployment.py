@@ -618,7 +618,7 @@ class DeploymentSpec:
         Add or override a command-line argument for a specific service
 
         Args:
-            service_name: Name of the service (e.g., "VllmDecodeWorker", "TRTLLMWorker")
+            service_name: Name of the service (e.g., "decode", "TRTLLMWorker")
             arg_name: Argument name (e.g., "--max-model-len", "--max-seq-len")
             arg_value: Argument value (e.g., "1024")
         """

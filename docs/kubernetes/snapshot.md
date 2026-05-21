@@ -275,7 +275,7 @@ spec:
         mainContainer:
           image: registry.example.com/dynamo/vllm-runtime:1.0.0
 
-    VllmDecodeWorker:
+    decode:
       componentType: worker
       replicas: 1
       checkpoint:
@@ -295,7 +295,7 @@ kubectl apply -f vllm-checkpointref-demo.yaml -n ${NAMESPACE}
 kubectl get pods -n ${NAMESPACE} -w
 ```
 
-The `VllmDecodeWorker` pod should restore from the ready checkpoint instead of creating a new one.
+The `decode` pod should restore from the ready checkpoint instead of creating a new one.
 
 ## Choosing a DGD checkpoint flow
 
@@ -391,7 +391,7 @@ spec:
         mainContainer:
           image: registry.example.com/dynamo/vllm-runtime:1.0.0
 
-    VllmDecodeWorker:
+    decode:
       componentType: worker
       replicas: 1
       checkpoint:
@@ -411,7 +411,7 @@ Useful inspection commands:
 
 ```bash
 kubectl get dgd vllm-auto-demo -n ${NAMESPACE} \
-  -o jsonpath='{.status.checkpoints.VllmDecodeWorker.checkpointName}{"\n"}{.status.checkpoints.VllmDecodeWorker.checkpointID}{"\n"}{.status.checkpoints.VllmDecodeWorker.ready}{"\n"}'
+  -o jsonpath='{.status.checkpoints.decode.checkpointName}{"\n"}{.status.checkpoints.decode.checkpointID}{"\n"}{.status.checkpoints.decode.ready}{"\n"}'
 
 kubectl get dckpt -n ${NAMESPACE}
 ```
@@ -420,7 +420,7 @@ If you use the default `Immediate` policy and want to create restored pods after
 
 ```bash
 kubectl patch dgd vllm-auto-demo -n ${NAMESPACE} --type=merge \
-  -p '{"spec":{"services":{"VllmDecodeWorker":{"replicas":2}}}}'
+  -p '{"spec":{"services":{"decode":{"replicas":2}}}}'
 ```
 
 ## Failover Restore
