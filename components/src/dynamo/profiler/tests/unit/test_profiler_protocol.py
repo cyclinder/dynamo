@@ -604,9 +604,9 @@ def test_build_dgd_config_pvc_without_model_path_uses_hf_model_name(
     for svc_name, svc in services.items():
         vms = svc.get("volumeMounts", [])
         mount_names = [vm["name"] for vm in vms if isinstance(vm, dict)]
-        assert pvc_name in mount_names, (
-            f"Service '{svc_name}' is missing volumeMount for PVC '{pvc_name}'"
-        )
+        assert (
+            pvc_name in mount_names
+        ), f"Service '{svc_name}' is missing volumeMount for PVC '{pvc_name}'"
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
@@ -642,9 +642,9 @@ def test_build_dgd_config_pvc_with_model_path_uses_pvc_path(backend) -> None:
             continue
         args = svc.get("extraPodSpec", {}).get("mainContainer", {}).get("args", [])
         flat_args = " ".join(args) if args else ""
-        assert model_path in flat_args, (
-            f"Worker '{svc_name}' should use PVC model path '{model_path}'. args={args}"
-        )
+        assert (
+            model_path in flat_args
+        ), f"Worker '{svc_name}' should use PVC model path '{model_path}'. args={args}"
 
 
 def test_build_dgd_config_pvc_without_model_path_sets_hf_home() -> None:
@@ -673,9 +673,9 @@ def test_build_dgd_config_pvc_without_model_path_sets_hf_home() -> None:
         hf_homes = [
             e for e in env_list if isinstance(e, dict) and e.get("name") == "HF_HOME"
         ]
-        assert len(hf_homes) == 1, (
-            f"Expected exactly one HF_HOME env on {svc_name}, got {len(hf_homes)}"
-        )
+        assert (
+            len(hf_homes) == 1
+        ), f"Expected exactly one HF_HOME env on {svc_name}, got {len(hf_homes)}"
         assert hf_homes[0]["value"] == mount, f"HF_HOME on {svc_name} should be {mount}"
 
 
@@ -706,6 +706,6 @@ def test_build_dgd_config_pvc_with_model_path_no_hf_home() -> None:
         hf_homes = [
             e for e in env_list if isinstance(e, dict) and e.get("name") == "HF_HOME"
         ]
-        assert len(hf_homes) == 0, (
-            f"HF_HOME should not be set on {svc_name} when model_path is a PVC subpath"
-        )
+        assert (
+            len(hf_homes) == 0
+        ), f"HF_HOME should not be set on {svc_name} when model_path is a PVC subpath"
