@@ -221,15 +221,11 @@ def parse_process_log(log_dir, process_name):
         "Frontend": re.compile(r"added model"),
         "decode": re.compile(
             r"worker for (?P<model_name>.*?) has been initialized"
+            r"|Model registration succeeded|Decode worker handler initialized|Worker handler initialized"
         ),
         "prefill": re.compile(
             r"worker for (?P<model_name>.*?) has been initialized"
-        ),
-        "decode": re.compile(
-            r"Model registration succeeded|Decode worker handler initialized|Worker handler initialized"
-        ),
-        "prefill": re.compile(
-            r"Model registration succeeded|Prefill worker handler initialized|Worker handler initialized"
+            r"|Model registration succeeded|Prefill worker handler initialized|Worker handler initialized"
         ),
         "TRTLLMWorker": re.compile(
             r"TrtllmWorker for (?P<model_name>.*?) has been initialized|Model registration succeeded"

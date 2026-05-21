@@ -105,19 +105,14 @@ WORKER_MAP = {
 WORKER_READY_PATTERNS: Dict[str, Pattern] = {
     # Frontend
     "Frontend": re.compile(r"added model"),
-    # vLLM workers
+    # vLLM and SGLang workers (shared short names)
     "decode": re.compile(
         r"worker for (?P<model_name>.*?) has been initialized"
+        r"|Model registration succeeded|Decode worker handler initialized|Worker handler initialized"
     ),
     "prefill": re.compile(
         r"worker for (?P<model_name>.*?) has been initialized"
-    ),
-    # SGLang workers - look for their specific initialization messages
-    "decode": re.compile(
-        r"Model registration succeeded|Decode worker handler initialized|Worker handler initialized"
-    ),
-    "prefill": re.compile(
-        r"Model registration succeeded|Prefill worker handler initialized|Worker handler initialized"
+        r"|Model registration succeeded|Prefill worker handler initialized|Worker handler initialized"
     ),
     # TensorRT-LLM workers
     "TRTLLMWorker": re.compile(
