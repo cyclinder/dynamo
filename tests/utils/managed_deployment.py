@@ -465,9 +465,9 @@ class DeploymentSpec:
     def disable_grove(self):
         if "annotations" not in self._deployment_spec["metadata"]:
             self._deployment_spec["metadata"]["annotations"] = {}
-        self._deployment_spec["metadata"]["annotations"]["nvidia.com/enable-grove"] = (
-            "false"
-        )
+        self._deployment_spec["metadata"]["annotations"][
+            "nvidia.com/enable-grove"
+        ] = "false"
 
     def set_model(self, model: str, service_name: Optional[str] = None):
         if service_name is None:
