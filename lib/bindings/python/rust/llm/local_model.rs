@@ -4,6 +4,9 @@
 use super::*;
 use llm_rs::local_model::runtime_config::DisaggregatedEndpoint as RsDisaggregatedEndpoint;
 use llm_rs::local_model::runtime_config::ModelRuntimeConfig as RsModelRuntimeConfig;
+use llm_rs::local_model::runtime_config::StructuralTagMode as RsStructuralTagMode;
+use llm_rs::local_model::runtime_config::StructuralTagSchemaMode as RsStructuralTagSchemaMode;
+use llm_rs::local_model::runtime_config::StructuralTagScope as RsStructuralTagScope;
 
 #[pyclass]
 #[derive(Clone, Debug, Default)]
@@ -148,6 +151,47 @@ impl ModelRuntimeConfig {
 
     fn get_engine_specific(&self, key: &str) -> PyResult<Option<String>> {
         self.inner.get_engine_specific(key).map_err(to_pyerr)
+    }
+
+    fn set_structural_tag_mode(&mut self, mode: &str) -> PyResult<()> {
+        self.inner.structural_tag_mode = match mode {
+            "off" => RsStructuralTagMode::Off,
+            "on" => RsStructuralTagMode::On,
+            _ => {
+                return Err(PyErr::new::<PyException, _>(format!(
+                    "Invalid structural_tag_mode: {mode}. Expected 'off' or 'on'."
+                )));
+            }
+        };
+        Ok(())
+    }
+
+    /// Set the structural tag scope ("auto" or "always").
+    fn set_structural_tag_scope(&mut self, scope: &str) -> PyResult<()> {
+        self.inner.structural_tag_scope = match scope {
+            "auto" => RsStructuralTagScope::Auto,
+            "always" => RsStructuralTagScope::Always,
+            _ => {
+                return Err(PyErr::new::<PyException, _>(format!(
+                    "Invalid structural_tag_scope: {scope}. Expected 'auto' or 'always'."
+                )));
+            }
+        };
+        Ok(())
+    }
+
+    /// Set the structural tag schema mode ("auto" or "strict").
+    fn set_structural_tag_schema(&mut self, schema: &str) -> PyResult<()> {
+        self.inner.structural_tag_schema = match schema {
+            "auto" => RsStructuralTagSchemaMode::Auto,
+            "strict" => RsStructuralTagSchemaMode::Strict,
+            _ => {
+                return Err(PyErr::new::<PyException, _>(format!(
+                    "Invalid structural_tag_schema: {schema}. Expected 'auto' or 'strict'."
+                )));
+            }
+        };
+        Ok(())
     }
 
     #[pyo3(signature = (bootstrap_host=None, bootstrap_port=None))]

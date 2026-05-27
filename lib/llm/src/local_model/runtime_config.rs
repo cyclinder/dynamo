@@ -7,6 +7,28 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::protocols::tensor;
 
+/// Re-export from parsers crate so that `ModelRuntimeConfig` can use it
+/// directly without type duplication.
+pub use dynamo_parsers::tool_calling::StructuralTagSchemaMode;
+
+/// Master switch for structural tag guided decoding.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuralTagMode {
+    #[default]
+    Off,
+    On,
+}
+
+/// Controls when structural tags are activated based on `tool_choice`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuralTagScope {
+    #[default]
+    Auto,
+    Always,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct DisaggregatedEndpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,6 +49,18 @@ pub struct ModelRuntimeConfig {
     pub tool_call_parser: Option<String>,
 
     pub reasoning_parser: Option<String>,
+
+    /// Whether structural tag guided decoding is enabled for tool calls.
+    #[serde(default)]
+    pub structural_tag_mode: StructuralTagMode,
+
+    /// Controls when structural tags are activated based on tool_choice.
+    #[serde(default)]
+    pub structural_tag_scope: StructuralTagScope,
+
+    /// Controls whether tools get real or generic schemas in structural tags.
+    #[serde(default)]
+    pub structural_tag_schema: StructuralTagSchemaMode,
 
     /// When true, strip tool definitions from the chat template when tool_choice is "none".
     #[serde(default = "default_exclude_tools_when_tool_choice_none")]
@@ -94,6 +128,9 @@ impl Default for ModelRuntimeConfig {
             max_num_batched_tokens: None,
             tool_call_parser: None,
             reasoning_parser: None,
+            structural_tag_mode: StructuralTagMode::Off,
+            structural_tag_scope: StructuralTagScope::Auto,
+            structural_tag_schema: StructuralTagSchemaMode::Auto,
             exclude_tools_when_tool_choice_none: default_exclude_tools_when_tool_choice_none(),
             data_parallel_start_rank: default_data_parallel_start_rank(),
             data_parallel_size: default_data_parallel_size(),

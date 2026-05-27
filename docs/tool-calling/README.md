@@ -38,6 +38,17 @@ OpenAI-compatible contract across vLLM, SGLang, TRTLLM, and other workers,
 while keeping the serving hot path highly concurrent and scalable, avoiding
 Python GIL bottlenecks.
 
+## Troubleshooting
+
+If a tool call comes back wrong, add `logprobs: true` to a single repro
+request and share the response. See
+[Troubleshooting Tool Calls](troubleshooting.md) for what to capture and
+include when reporting an issue.
+
+## Optional: structural tags
+
+You can optionally turn on **xgrammar structural tags** so guided decoding matches the parser's tool-call format at token granularity. See [Structural tag (guided decoding for tool calls)](structural-tag.md).
+
 ## See Also
 
 - [Reasoning](../reasoning/README.md) -- separate `reasoning_content` from
@@ -45,3 +56,5 @@ Python GIL bottlenecks.
   tool-call parser and a reasoning parser configured together.
 - [Frontend Configuration Reference](../components/frontend/configuration.md) --
   full CLI flag reference.
+- [Structural tag (guided decoding)](structural-tag.md) — optional xgrammar
+  constraints aligned with Dynamo tool-call parsers.

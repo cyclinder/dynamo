@@ -23,6 +23,10 @@ use dynamo_backend_common::{
     EngineConfig as RsEngineConfig, ErrorType, LLMEngine, LLMEngineOutput, PreprocessedRequest,
     RuntimeConfig as RsRuntimeConfig, Worker as RsWorker, WorkerConfig as RsWorkerConfig,
 };
+use dynamo_llm::local_model::runtime_config::{
+    StructuralTagMode as RsStructuralTagMode, StructuralTagSchemaMode as RsStructuralTagSchemaMode,
+    StructuralTagScope as RsStructuralTagScope,
+};
 use dynamo_llm::model_type::ModelInput as RsModelInput;
 use dynamo_runtime as rs;
 use dynamo_runtime::logging::{DistributedTraceContext, get_distributed_tracing_context};
@@ -237,6 +241,9 @@ impl WorkerConfig {
         metrics_labels = Vec::new(),
         runtime = None,
         disaggregation_mode = DisaggregationMode::Aggregated,
+        structural_tag_mode = "off".to_string(),
+        structural_tag_scope = "auto".to_string(),
+        structural_tag_schema = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -255,14 +262,44 @@ impl WorkerConfig {
         metrics_labels: Vec<(String, String)>,
         runtime: Option<RuntimeConfig>,
         disaggregation_mode: DisaggregationMode,
-    ) -> Self {
+        structural_tag_mode: String,
+        structural_tag_scope: String,
+        structural_tag_schema: String,
+    ) -> PyResult<Self> {
         // Delegating to the same conversion used by `register_model`.
         let model_input_rs = match model_input {
             ModelInput::Text => RsModelInput::Text,
             ModelInput::Tokens => RsModelInput::Tokens,
             ModelInput::Tensor => RsModelInput::Tensor,
         };
-        Self {
+        let st_mode = match structural_tag_mode.as_str() {
+            "off" => RsStructuralTagMode::Off,
+            "on" => RsStructuralTagMode::On,
+            other => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid structural_tag_mode: {other}. Expected 'off' or 'on'."
+                )));
+            }
+        };
+        let st_scope = match structural_tag_scope.as_str() {
+            "auto" => RsStructuralTagScope::Auto,
+            "always" => RsStructuralTagScope::Always,
+            other => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid structural_tag_scope: {other}. Expected 'auto' or 'always'."
+                )));
+            }
+        };
+        let st_schema = match structural_tag_schema.as_str() {
+            "auto" => RsStructuralTagSchemaMode::Auto,
+            "strict" => RsStructuralTagSchemaMode::Strict,
+            other => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid structural_tag_schema: {other}. Expected 'auto' or 'strict'."
+                )));
+            }
+        };
+        Ok(Self {
             inner: RsWorkerConfig {
                 namespace,
                 component,
@@ -278,6 +315,9 @@ impl WorkerConfig {
                 enable_local_indexer,
                 metrics_labels,
                 disaggregation_mode: disaggregation_mode.into(),
+                structural_tag_mode: st_mode,
+                structural_tag_scope: st_scope,
+                structural_tag_schema: st_schema,
                 runtime: runtime.map(|r| r.inner).unwrap_or_default(),
             },
         }

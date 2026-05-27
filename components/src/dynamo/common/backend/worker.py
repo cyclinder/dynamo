@@ -96,6 +96,9 @@ class WorkerConfig:
     # Decode→disable local indexer); engines read it from their own runtime
     # config to switch per-mode protocol behavior in `generate()`.
     disaggregation_mode: DisaggregationMode = DisaggregationMode.AGGREGATED
+    structural_tag_mode: str = "off"
+    structural_tag_scope: str = "auto"
+    structural_tag_schema: str = "auto"
 
     @classmethod
     def from_runtime_config(
@@ -133,6 +136,17 @@ class WorkerConfig:
                 runtime_cfg, "exclude_tools_when_tool_choice_none", True
             ),
             "enable_local_indexer": getattr(runtime_cfg, "enable_local_indexer", True),
+            "structural_tag_mode": (
+                "on"
+                if getattr(runtime_cfg, "dyn_enable_structural_tag", False)
+                else "off"
+            ),
+            "structural_tag_scope": getattr(
+                runtime_cfg, "dyn_structural_tag_scope", "auto"
+            ),
+            "structural_tag_schema": getattr(
+                runtime_cfg, "dyn_structural_tag_schema", "auto"
+            ),
         }
         # vLLM/TRT-LLM expose `disaggregation_mode`; SGLang exposes
         # `serving_mode`. Skip the probe when an override is supplied so
@@ -198,6 +212,9 @@ class Worker:
             disaggregation_mode=_to_rust_disaggregation_mode(
                 self.config.disaggregation_mode
             ),
+            structural_tag_mode=self.config.structural_tag_mode,
+            structural_tag_scope=self.config.structural_tag_scope,
+            structural_tag_schema=self.config.structural_tag_schema,
             runtime=runtime_cfg,
         )
 

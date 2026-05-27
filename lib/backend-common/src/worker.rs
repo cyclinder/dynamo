@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use dynamo_llm::local_model::LocalModel;
 use dynamo_llm::local_model::LocalModelBuilder;
-use dynamo_llm::local_model::runtime_config::{DisaggregatedEndpoint, ModelRuntimeConfig};
+use dynamo_llm::local_model::runtime_config::{
+    DisaggregatedEndpoint, ModelRuntimeConfig, StructuralTagMode, StructuralTagSchemaMode,
+    StructuralTagScope,
+};
 use dynamo_llm::model_type::{ModelInput, ModelType};
 use dynamo_runtime::pipeline::network::Ingress;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
@@ -130,6 +133,12 @@ pub struct WorkerConfig {
     /// but force-disables the local KV indexer because decode workers do not
     /// host the indexer endpoint.
     pub disaggregation_mode: DisaggregationMode,
+    /// Structural tag guided decoding mode.
+    pub structural_tag_mode: StructuralTagMode,
+    /// Structural tag activation scope.
+    pub structural_tag_scope: StructuralTagScope,
+    /// Structural tag schema strictness.
+    pub structural_tag_schema: StructuralTagSchemaMode,
     /// Runtime / transport overrides applied via env vars before the
     /// `DistributedRuntime` is constructed.
     pub runtime: RuntimeConfig,
@@ -152,6 +161,9 @@ impl Default for WorkerConfig {
             enable_local_indexer: true,
             metrics_labels: Vec::new(),
             disaggregation_mode: DisaggregationMode::Aggregated,
+            structural_tag_mode: StructuralTagMode::Off,
+            structural_tag_scope: StructuralTagScope::Auto,
+            structural_tag_schema: StructuralTagSchemaMode::Auto,
             runtime: RuntimeConfig::default(),
         }
     }
@@ -750,6 +762,9 @@ async fn build_local_model(
         tool_call_parser: config.tool_call_parser.clone(),
         reasoning_parser: config.reasoning_parser.clone(),
         exclude_tools_when_tool_choice_none: config.exclude_tools_when_tool_choice_none,
+        structural_tag_mode: config.structural_tag_mode,
+        structural_tag_scope: config.structural_tag_scope,
+        structural_tag_schema: config.structural_tag_schema,
         enable_local_indexer,
         disaggregated_endpoint,
         ..ModelRuntimeConfig::default()
