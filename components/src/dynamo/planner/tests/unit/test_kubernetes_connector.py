@@ -1056,9 +1056,7 @@ def test_resolve_dgd_service_prefill_uses_backend_default_for_filter(
     kubernetes_connector, mock_kube_api
 ):
     """vLLM prefill: filter name = "prefill" (MDC side), not DGD component name."""
-    mock_deployment = _deployment(
-        _component("custom-prefill", "prefill", replicas=1)
-    )
+    mock_deployment = _deployment(_component("custom-prefill", "prefill", replicas=1))
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     dgd_service_name, expected_component = kubernetes_connector._resolve_dgd_service(
