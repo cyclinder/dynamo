@@ -1074,59 +1074,36 @@ def test_resolve_dgd_service_prefill_uses_backend_default_for_filter(
 def test_resolve_dgd_service_v1beta_endpoint_override(
     kubernetes_connector, mock_kube_api
 ):
-    mock_deployment = {
-        "metadata": {"name": "test-graph"},
-        "spec": {
-            "services": {
-                "prefill": {
-                    "replicas": 1,
-                    "type": "prefill",
-                    "podTemplate": {
-                        "spec": {
-                            "containers": [
-                                {
-                                    "name": "main",
-                                    "args": [
-                                        "--endpoint",
-                                        "my-ns.my-custom-prefill.generate",
-                                        "--model",
-                                        "Qwen/Qwen3-8B",
-                                    ],
-                                }
-                            ]
-                        }
-                    },
-                },
-            }
-        },
-    }
+    mock_deployment = _deployment(
+        _component(
+            "prefill",
+            component_type="prefill",
+            replicas=1,
+            args=[
+                "--endpoint",
+                "my-ns.my-custom-prefill.generate",
+                "--model",
+                "Qwen/Qwen3-8B",
+            ],
+        )
+    )
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     dgd_service_name, expected_component = kubernetes_connector._resolve_dgd_service(
         SubComponentType.PREFILL, backend="vllm"
     )
 
-    # k8s operations (e.g. replica patch) still target the PascalCase DGD key.
     assert dgd_service_name == "prefill"
-    # The filter side must match what the Rust runtime writes to MDC.
-    assert expected_component == "prefill"
+    assert expected_component == "my-custom-prefill"
 
 
 def test_resolve_dgd_service_decode_uses_backend_default_for_filter(
     kubernetes_connector, mock_kube_api
 ):
     """vLLM decode: MDC carries "backend", NOT "decode"; filter must match that."""
-    mock_deployment = {
-        "metadata": {"name": "test-graph"},
-        "spec": {
-            "services": {
-                "decode": {
-                    "replicas": 1,
-                    "subComponentType": "decode",
-                },
-            }
-        },
-    }
+    mock_deployment = _deployment(
+        _component("decode", component_type="decode", replicas=1)
+    )
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     dgd_service_name, expected_component = kubernetes_connector._resolve_dgd_service(
@@ -1177,27 +1154,19 @@ def test_resolve_dgd_service_respects_user_endpoint_override(
     kubernetes_connector, mock_kube_api
 ):
     """If the DGD passes --endpoint ns.comp.ep, the MDC filter must use 'comp'."""
-    mock_deployment = {
-        "metadata": {"name": "test-graph"},
-        "spec": {
-            "services": {
-                "prefill": {
-                    "replicas": 1,
-                    "subComponentType": "prefill",
-                    "extraPodSpec": {
-                        "mainContainer": {
-                            "args": [
-                                "--endpoint",
-                                "my-ns.my-custom-prefill.generate",
-                                "--model",
-                                "Qwen/Qwen3-8B",
-                            ]
-                        }
-                    },
-                },
-            }
-        },
-    }
+    mock_deployment = _deployment(
+        _component(
+            "prefill",
+            component_type="prefill",
+            replicas=1,
+            args=[
+                "--endpoint",
+                "my-ns.my-custom-prefill.generate",
+                "--model",
+                "Qwen/Qwen3-8B",
+            ],
+        )
+    )
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     dgd_service_name, expected_component = kubernetes_connector._resolve_dgd_service(
@@ -1215,25 +1184,17 @@ def test_resolve_dgd_service_endpoint_override_with_dyn_prefix(
     kubernetes_connector, mock_kube_api
 ):
     """parse_endpoint accepts 'dyn://' prefix; the extracted component must strip it."""
-    mock_deployment = {
-        "metadata": {"name": "test-graph"},
-        "spec": {
-            "services": {
-                "decode": {
-                    "replicas": 1,
-                    "subComponentType": "decode",
-                    "extraPodSpec": {
-                        "mainContainer": {
-                            "args": [
-                                "--endpoint",
-                                "dyn://ns.user-decode.generate",
-                            ]
-                        }
-                    },
-                },
-            }
-        },
-    }
+    mock_deployment = _deployment(
+        _component(
+            "decode",
+            component_type="decode",
+            replicas=1,
+            args=[
+                "--endpoint",
+                "dyn://ns.user-decode.generate",
+            ],
+        )
+    )
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     _, expected_component = kubernetes_connector._resolve_dgd_service(
@@ -1247,22 +1208,14 @@ def test_resolve_dgd_service_malformed_endpoint_falls_back_to_default(
     kubernetes_connector, mock_kube_api
 ):
     """Malformed --endpoint (wrong number of parts) falls back to backend default."""
-    mock_deployment = {
-        "metadata": {"name": "test-graph"},
-        "spec": {
-            "services": {
-                "prefill": {
-                    "replicas": 1,
-                    "subComponentType": "prefill",
-                    "extraPodSpec": {
-                        "mainContainer": {
-                            "args": ["--endpoint", "only-two.parts"],
-                        }
-                    },
-                },
-            }
-        },
-    }
+    mock_deployment = _deployment(
+        _component(
+            "prefill",
+            component_type="prefill",
+            replicas=1,
+            args=["--endpoint", "only-two.parts"],
+        )
+    )
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
     _, expected_component = kubernetes_connector._resolve_dgd_service(
@@ -1276,13 +1229,18 @@ def test_service_get_component_name_from_endpoint_arg_present():
     service = Service(
         name="prefill",
         service={
-            "extraPodSpec": {
-                "mainContainer": {
-                    "args": [
-                        "--endpoint",
-                        "ns.custom-comp.generate",
-                        "--other",
-                        "flag",
+            "podTemplate": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "main",
+                            "args": [
+                                "--endpoint",
+                                "ns.custom-comp.generate",
+                                "--other",
+                                "flag",
+                            ],
+                        }
                     ]
                 }
             }
@@ -1295,9 +1253,14 @@ def test_service_get_component_name_from_endpoint_arg_absent():
     service = Service(
         name="prefill",
         service={
-            "extraPodSpec": {
-                "mainContainer": {
-                    "args": ["--model", "Qwen/Qwen3-8B"],
+            "podTemplate": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "main",
+                            "args": ["--model", "Qwen/Qwen3-8B"],
+                        }
+                    ]
                 }
             }
         },
@@ -1309,6 +1272,17 @@ def test_service_get_component_name_from_endpoint_arg_missing_value():
     """--endpoint with no following arg should return None, not raise IndexError."""
     service = Service(
         name="prefill",
-        service={"extraPodSpec": {"mainContainer": {"args": ["--endpoint"]}}},
+        service={
+            "podTemplate": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "main",
+                            "args": ["--endpoint"],
+                        }
+                    ]
+                }
+            }
+        },
     )
     assert service.get_component_name_from_endpoint_arg() is None
