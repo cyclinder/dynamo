@@ -16,6 +16,7 @@ use super::Metrics;
 use super::RouteDoc;
 use super::metrics;
 use super::metrics::register_worker_timing_metrics;
+use super::stateful_responses::ResponseContextStoreManager;
 use crate::discovery::ModelManager;
 use crate::endpoint_type::EndpointType;
 use crate::kv_router::metrics::{
@@ -62,6 +63,7 @@ pub struct State {
     flags: StateFlags,
     cancel_token: CancellationToken,
     nvext_enabled: bool,
+    responses_context_store: ResponseContextStoreManager,
 }
 
 #[derive(Default, Debug)]
@@ -132,7 +134,7 @@ impl State {
         manager: Arc<ModelManager>,
         discovery_client: Arc<dyn Discovery>,
         cancel_token: CancellationToken,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::new_with_nvext_enabled(manager, discovery_client, cancel_token, true)
     }
 
@@ -141,8 +143,8 @@ impl State {
         discovery_client: Arc<dyn Discovery>,
         cancel_token: CancellationToken,
         nvext_enabled: bool,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             manager,
             metrics: Arc::new(Metrics::default()),
             discovery_client,
@@ -159,7 +161,8 @@ impl State {
                 anthropic_endpoints_enabled: AtomicBool::new(false),
             },
             cancel_token,
-        }
+            responses_context_store: ResponseContextStoreManager::from_env()?,
+        })
     }
 
     /// Get the Prometheus [`Metrics`] object which tracks request counts and inflight requests
@@ -194,6 +197,10 @@ impl State {
     /// Get the cancellation token
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    pub fn responses_context_store(&self) -> &ResponseContextStoreManager {
+        &self.responses_context_store
     }
 
     // TODO
@@ -607,7 +614,7 @@ impl HttpServiceConfigBuilder {
             discovery_client,
             cancel_token,
             nvext_enabled,
-        ));
+        )?);
         state
             .flags
             .set(&EndpointType::Chat, config.enable_chat_endpoints);
