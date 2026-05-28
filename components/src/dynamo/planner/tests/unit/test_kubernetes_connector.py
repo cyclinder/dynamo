@@ -215,12 +215,12 @@ def test_get_service_name_from_v1beta_component_type(kubernetes_connector):
         "spec": {
             "components": [
                 {
-                    "name": "VllmPrefillWorker",
+                    "name": "prefill",
                     "replicas": 2,
                     "type": "prefill",
                 },
                 {
-                    "name": "VllmDecodeWorker",
+                    "name": "decode",
                     "replicas": 3,
                     "type": "decode",
                 },
@@ -229,11 +229,11 @@ def test_get_service_name_from_v1beta_component_type(kubernetes_connector):
     }
 
     service = get_component_from_type_or_name(deployment, SubComponentType.PREFILL)
-    assert service.name == "VllmPrefillWorker"
+    assert service.name == "prefill"
     assert service.number_replicas() == 2
 
     service = get_component_from_type_or_name(deployment, SubComponentType.DECODE)
-    assert service.name == "VllmDecodeWorker"
+    assert service.name == "decode"
     assert service.number_replicas() == 3
 
 
@@ -811,7 +811,7 @@ def test_service_get_gpu_count_invalid_raises_error():
 
 def test_service_reads_v1beta_pod_template_main_container():
     service = Service(
-        name="VllmPrefillWorker",
+        name="prefill",
         service={
             "podTemplate": {
                 "spec": {
@@ -1057,7 +1057,7 @@ def test_resolve_dgd_service_prefill_uses_backend_default_for_filter(
 ):
     """vLLM prefill: filter name = "prefill" (MDC side), not DGD component name."""
     mock_deployment = _deployment(
-        _component("VllmPrefillWorker", "prefill", replicas=1)
+        _component("custom-prefill", "prefill", replicas=1)
     )
     mock_kube_api.get_graph_deployment.return_value = mock_deployment
 
@@ -1065,8 +1065,8 @@ def test_resolve_dgd_service_prefill_uses_backend_default_for_filter(
         SubComponentType.PREFILL, backend="vllm"
     )
 
-    # k8s operations (e.g. replica patch) still target the PascalCase DGD component.
-    assert dgd_service_name == "VllmPrefillWorker"
+    # k8s operations (e.g. replica patch) still target the DGD component name.
+    assert dgd_service_name == "custom-prefill"
     # The filter side must match what the Rust runtime writes to MDC.
     assert expected_component == "prefill"
 

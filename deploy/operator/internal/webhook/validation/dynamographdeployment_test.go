@@ -640,7 +640,7 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 				},
 				Spec: nvidiacomv1alpha1.DynamoGraphDeploymentSpec{
 					Services: map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
-						"VllmPrefillWorker": {
+						"prefill-long-svc-name": {
 							Multinode: &nvidiacomv1alpha1.MultinodeSpec{
 								NodeCount: 2,
 							},
@@ -759,7 +759,7 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 				},
 				Spec: nvidiacomv1alpha1.DynamoGraphDeploymentSpec{
 					Services: map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
-						"VllmPrefillWorker": {
+						"prefill": {
 							Multinode: &nvidiacomv1alpha1.MultinodeSpec{
 								NodeCount: 2,
 							},
