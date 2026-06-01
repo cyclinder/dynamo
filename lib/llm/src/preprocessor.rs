@@ -25,10 +25,10 @@ use dynamo_protocols::types::{
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionToolChoiceOption, EncodingFormat,
 };
+use dynamo_renderer::OAIPromptFormatter;
 use dynamo_runtime::error::{DynamoError, ErrorType};
 use futures::Stream;
 use futures::stream::{self, StreamExt};
-use prompt::OAIPromptFormatter;
 use std::time::{Duration, Instant};
 
 use dynamo_runtime::dynamo_nvtx_range;
@@ -44,7 +44,6 @@ use tracing;
 use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo};
 use crate::preprocessor::media::MediaLoader;
-use crate::preprocessor::prompt::OAIChatLikeRequest;
 use crate::protocols::common::preprocessor::{
     MultimodalData, MultimodalDataMap, PreprocessedRequestBuilder, RoutingHints,
 };
@@ -72,7 +71,8 @@ use crate::protocols::{
 };
 use crate::tokenizers::traits::Tokenizer;
 
-use crate::preprocessor::prompt::{PromptFormatter, PromptInput, TextInput, TokenInput};
+use crate::preprocessor::prompt::{MediaRequestExt, prompt_formatter_from_mdc};
+use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, PromptInput, TextInput, TokenInput};
 
 pub use crate::protocols::common::llm_backend::{BackendOutput, PreprocessedRequest};
 pub use crate::protocols::common::preprocessor::PreprocessedEmbeddingRequest;
@@ -241,7 +241,7 @@ pub struct OpenAIPreprocessor {
 
 impl OpenAIPreprocessor {
     pub fn new(mdc: ModelDeploymentCard) -> Result<Arc<Self>> {
-        let formatter = PromptFormatter::from_mdc(&mdc)?;
+        let formatter = prompt_formatter_from_mdc(&mdc)?;
         let tokenizer = mdc.tokenizer()?;
         match formatter {
             PromptFormatter::OAI(formatter) => Self::new_with_parts(mdc, formatter, tokenizer),
@@ -405,6 +405,7 @@ impl OpenAIPreprocessor {
     /// - `token_ids`
     pub async fn preprocess_request<
         R: OAIChatLikeRequest
+            + MediaRequestExt
             + AnnotationsProvider
             + SamplingOptionsProvider
             + StopConditionsProvider
@@ -628,7 +629,9 @@ impl OpenAIPreprocessor {
         }
     }
 
-    pub async fn gather_multi_modal_data<R: OAIChatLikeRequest>(
+    pub async fn gather_multi_modal_data<
+        R: OAIChatLikeRequest + MediaRequestExt + NvExtProvider,
+    >(
         &self,
         request: &R,
         builder: &mut PreprocessedRequestBuilder,
@@ -2132,8 +2135,7 @@ impl OpenAIPreprocessor {
             }
             Some("deepseek_r1") | Some("deepseek_v4") | Some("deepseek-v4")
             | Some("deepseekv4") => {
-                if let Some(enabled) =
-                    crate::preprocessor::prompt::thinking_bool_from_args(chat_template_args)
+                if let Some(enabled) = dynamo_renderer::thinking_bool_from_args(chat_template_args)
                 {
                     return !enabled;
                 }
@@ -2145,8 +2147,7 @@ impl OpenAIPreprocessor {
                 false
             }
             Some("gemma4") | Some("gemma-4") => {
-                if let Some(enabled) =
-                    crate::preprocessor::prompt::thinking_bool_from_args(chat_template_args)
+                if let Some(enabled) = dynamo_renderer::thinking_bool_from_args(chat_template_args)
                 {
                     return !enabled;
                 }

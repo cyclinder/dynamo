@@ -7,6 +7,7 @@ members = [
     "lib/runtime",
     "lib/config",
     "lib/tokenizers",
+    "lib/renderer",
     "lib/tokens",
     "lib/mocker",
     "lib/kv-router",
@@ -42,6 +43,7 @@ dynamo-runtime = { path = "lib/runtime", version = "1.2.1" }
 dynamo-llm = { path = "lib/llm", version = "1.2.1" }
 dynamo-config = { path = "lib/config", version = "1.2.1" }
 dynamo-tokenizers = { path = "lib/tokenizers", version = "1.2.1" }
+dynamo-renderer = { path = "lib/renderer", version = "1.2.1" }
 dynamo-tokens = { path = "lib/tokens", version = "1.2.1" }
 dynamo-memory = { path = "lib/memory", version = "1.2.1" }
 dynamo-mocker = { path = "lib/mocker", version = "1.2.1" }
