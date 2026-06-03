@@ -843,3 +843,68 @@ def apply_dgd_overrides(dgd_config: dict, overrides: dict) -> dict:
             filtered["metadata"] = sanitized_metadata
     _deep_merge_overrides(result, filtered, path=[])
     return result
+
+
+# Backends whose worker engines read `--trust-remote-code` as a CLI flag.
+# TRT-LLM uses a YAML `trust_remote_code: true` field instead and is handled
+# by its own config modifier; it is intentionally excluded here.
+_TRUST_REMOTE_CODE_BACKENDS = frozenset({"vllm", "sglang"})
+_TRUST_REMOTE_CODE_FLAG = "--trust-remote-code"
+
+
+def auto_inject_trust_remote_code(
+    config: dict,
+    model_name_or_path: str,
+    backend: str,
+    *,
+    hf_token: str | None = None,
+) -> list[str]:
+    """Append ``--trust-remote-code`` to vllm/sglang workers when the HF
+    model ships custom Python (``auto_map`` present in ``config.json``).
+
+    Without this flag the worker container crashes at load with a pydantic
+    ``ValidationError: ... contains custom code which must be executed``.
+    AIC's DGD templates do not propagate the flag today, so every model in
+    the Nemotron-H / DeepSeek-V4 / GLM-5 / GPT-OSS / Kimi families fails
+    its first DGDR run without it.
+
+    Mutates *config* in place. Idempotent — workers that already have the
+    flag are skipped. ``Frontend`` and ``Planner`` services are skipped
+    (same exclusion list as ``apply_dgd_overrides``). Returns the list of
+    service names that were modified.
+    """
+    # Local import to keep ``protocol`` free of a hard dep on model_info,
+    # which pulls in ``transformers``/``huggingface_hub``.
+    from dynamo.profiler.utils.model_info import model_has_auto_map
+
+    if backend not in _TRUST_REMOTE_CODE_BACKENDS:
+        return []
+    if not model_has_auto_map(model_name_or_path, token=hf_token):
+        return []
+
+    services = config.get("spec", {}).get("services", {})
+    modified: list[str] = []
+    for svc_name, svc in services.items():
+        if not isinstance(svc, dict) or svc_name in _OVERRIDE_NON_WORKER_SERVICES:
+            continue
+        extra_pod_spec = svc.get("extraPodSpec")
+        if not isinstance(extra_pod_spec, dict):
+            continue
+        main_container = extra_pod_spec.get("mainContainer")
+        if not isinstance(main_container, dict):
+            continue
+        args = main_container.get("args") or []
+        if _TRUST_REMOTE_CODE_FLAG in args:
+            continue
+        main_container["args"] = list(args) + [_TRUST_REMOTE_CODE_FLAG]
+        modified.append(svc_name)
+
+    if modified:
+        logger.info(
+            "Auto-injected %s on worker(s) %s: HF model %r declares `auto_map` "
+            "(ships custom Python).",
+            _TRUST_REMOTE_CODE_FLAG,
+            modified,
+            model_name_or_path,
+        )
+    return modified

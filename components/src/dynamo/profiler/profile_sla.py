@@ -30,7 +30,10 @@ from dynamo.profiler.thorough import run_thorough
 from dynamo.profiler.utils.config_modifiers.parallelization_mapping import (
     PickedParallelConfig,
 )
-from dynamo.profiler.utils.config_modifiers.protocol import apply_dgd_overrides
+from dynamo.profiler.utils.config_modifiers.protocol import (
+    apply_dgd_overrides,
+    auto_inject_trust_remote_code,
+)
 from dynamo.profiler.utils.defaults import SearchStrategy
 from dynamo.profiler.utils.dgd_generation import (
     assemble_final_config,
@@ -536,6 +539,18 @@ async def run_profile(
             elif isinstance(final_config, dict):
                 final_config = apply_dgd_overrides(final_config, dgdr.overrides.dgd)
             logger.info("Applied DGD overrides to the final config.")
+
+        # Auto-inject --trust-remote-code for HF models that ship custom
+        # Python (`auto_map` in config.json). Runs after user overrides so
+        # an explicit override wins and we don't duplicate the flag.
+        if final_config:
+            trc_target = (
+                final_config[-1] if isinstance(final_config, list) else final_config
+            )
+            if isinstance(trc_target, dict):
+                auto_inject_trust_remote_code(
+                    trc_target, resolve_model_path(dgdr), resolved_backend
+                )
 
         # Propagate profiling-job tolerations to the final DGD (covers any
         # services added by assemble_final_config, e.g. Planner).
