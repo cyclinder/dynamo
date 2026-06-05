@@ -991,30 +991,27 @@ impl OpenAIPreprocessor {
                 extra_args["formatted_prompt"] = serde_json::Value::String(prompt.clone());
             }
 
-            // Forward routing-side mm_hashes as `multi_modal_uuids` so vLLM
-            // publishes KV events with the same key the router computes.
-            // The kv-router parses events via parse_mm_hash_from_extra_key
-            // (kv-router/src/zmq_wire/extra_keys.rs), which requires exactly
-            // 64 hex chars and reads u64 from the first 16. We pad u64 ->
-            // 16 hex chars + 48 zeros so the byte representation matches
-            // end-to-end without forcing frontend image decoding.
+            // Forward routing-side mm_hashes in `extra_args["mm_hashes"]` so the
+            // backend's KV events publish under the same key the router computes.
+            // Always the canonical 16-char hex (u64); each backend adapts it:
+            // sglang reads `int(hex, 16)` as-is, vLLM pads to its 64-char
+            // BlockStored form. No information is lost — both carry the same u64.
             //
             // Skip forwarding entirely if any image failed dim resolution —
             // a shorter `mm_hashes` list would misalign with the image
-            // positions vLLM derives from `multi_modal_data`, and the
-            // backend would inject the wrong UUIDs onto the wrong images.
+            // positions the backend derives from `multi_modal_data`, and
+            // the wrong UUIDs would get injected onto the wrong images.
             #[cfg(feature = "lightseek-mm")]
-            if !mm_image_entries.is_empty() && mm_image_entries.len() == total_image_count {
-                // 48 trailing zeros — paired with the {:016x} prefix this gives
-                // the 64-char hex string the kv-router's parse_mm_hash_from_extra_key
-                // expects (reads u64 from the first 16 chars).
-                const HEX_PAD: &str = "000000000000000000000000000000000000000000000000";
+            if self.image_token_id.is_some()
+                && !mm_image_entries.is_empty()
+                && mm_image_entries.len() == total_image_count
+            {
                 let hexes: Vec<serde_json::Value> = mm_image_entries
                     .iter()
-                    .map(|e| serde_json::Value::String(format!("{:016x}{}", e.mm_hash, HEX_PAD)))
+                    .map(|e| serde_json::Value::String(format!("{:016x}", e.mm_hash)))
                     .collect();
                 extra_args["mm_hashes"] = serde_json::Value::Array(hexes);
-            } else if !mm_image_entries.is_empty() {
+            } else if !mm_image_entries.is_empty() && self.image_token_id.is_some() {
                 tracing::warn!(
                     target: "mm_routing",
                     resolved = mm_image_entries.len(),
@@ -1060,7 +1057,6 @@ impl OpenAIPreprocessor {
         token_ids: &[crate::protocols::TokenIdType],
     ) -> Result<()> {
         use crate::protocols::common::preprocessor::MmRoutingInfo;
-        use dynamo_kv_router::protocols::{RequestExtraInfo, RequestMmObjectInfo};
 
         if mm_image_entries.is_empty() {
             return Ok(());
@@ -1146,15 +1142,19 @@ impl OpenAIPreprocessor {
             .collect();
         let n_total: usize = n_tokens.iter().sum();
 
+        // Canonical pad_value fill at image positions for ALL backends. sglang
+        // consumes pad_value natively; vLLM events are normalized to pad_value
+        // in the kv-router (see `create_stored_blocks`), so the frontend stays
+        // backend-agnostic. pad_value formula pinned by
+        // `pad_value_matches_sglang_protocol` in dynamo_kv_router.
         let mut expanded: Vec<crate::protocols::TokenIdType> =
             Vec::with_capacity(normalized_token_ids.len() + n_total);
-        let mut img_ranges: Vec<(usize, usize)> = Vec::with_capacity(mm_image_entries.len());
         let mut i = 0usize;
         for &t in normalized_token_ids.iter() {
             if t == image_token_id && i < mm_image_entries.len() {
-                let start = expanded.len();
-                expanded.extend(std::iter::repeat_n(image_token_id, n_tokens[i]));
-                img_ranges.push((start, start + n_tokens[i]));
+                let fill_token =
+                    dynamo_kv_router::protocols::pad_value_for_mm_hash(mm_image_entries[i].mm_hash);
+                expanded.extend(std::iter::repeat_n(fill_token, n_tokens[i]));
                 i += 1;
             } else {
                 expanded.push(t);
@@ -1172,30 +1172,21 @@ impl OpenAIPreprocessor {
             expanded.resize(total_tokens, 0);
         }
 
-        // Build request-level MM info, then derive per-block info.
-        let mm_objects: Vec<RequestMmObjectInfo> = mm_image_entries
-            .iter()
-            .zip(img_ranges.iter())
-            .map(|(entry, &(s, e))| RequestMmObjectInfo {
-                mm_hash: entry.mm_hash,
-                offsets: vec![(s, e)],
-            })
-            .collect();
-        let block_mm_infos =
-            RequestExtraInfo { mm_objects }.to_block_level(block_size, total_tokens);
-
+        // pad_value already encodes mm_hash in the routing tokens the router
+        // hashes, so block_mm_infos is always empty (the canonical scheme for
+        // both backends). The mm identity rides in the token stream, not a
+        // side channel.
         tracing::debug!(
             target: "mm_routing",
             n_images = mm_image_entries.len(),
             block_size,
             total_tokens,
-            n_blocks = block_mm_infos.len(),
-            "lightseek MmRoutingInfo built (exact)"
+            "MmRoutingInfo built (exact, pad_value)"
         );
 
         builder.mm_routing_info(Some(MmRoutingInfo {
             routing_token_ids: expanded,
-            block_mm_infos,
+            block_mm_infos: Vec::new(),
         }));
         Ok(())
     }
