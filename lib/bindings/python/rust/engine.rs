@@ -353,13 +353,26 @@ where
         })
     })?;
     let response = tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| depythonize::<Resp>(&item.into_bound(py)))
+        Python::with_gil(|py| {
+            let bound = item.into_bound(py);
+            // Yields tagged with `_dynamo_annotated: True` are wire
+            // Annotated<R> envelopes; everything else is plain data.
+            let is_envelope = bound
+                .downcast::<PyDict>()
+                .ok()
+                .and_then(|d| d.get_item("_dynamo_annotated").ok().flatten())
+                .and_then(|v| v.is_truthy().ok())
+                .unwrap_or(false);
+            if is_envelope {
+                depythonize::<Annotated<Resp>>(&bound)
+            } else {
+                depythonize::<Resp>(&bound).map(Annotated::from_data)
+            }
+        })
     })
     .await
     .map_err(|e| ResponseProcessingError::Offload(e.to_string()))?
     .map_err(|e| ResponseProcessingError::Deserialize(e.to_string()))?;
-
-    let response = Annotated::from_data(response);
 
     Ok(response)
 }
