@@ -5,10 +5,11 @@ makes based on the configured tool-call / reasoning parser. Each case
 below names one decision the preprocessor takes; the **per-parser truth
 table** at the bottom records what each parser expects.
 
-This is the preprocessor-layer counterpart to
-[`lib/parsers/PARSER_CASES.md`](../parsers/PARSER_CASES.md). Parsers are
-unit-tested for output correctness on input shapes (CASE.\*); the
-preprocessor is unit-tested for *whether the right config knob fires for
+This is the preprocessor-layer counterpart to the parser conformance cases
+now owned by
+[`ai-dynamo/frontend-crates`](https://github.com/ai-dynamo/frontend-crates).
+Parsers are unit-tested for output correctness on input shapes (CASE.\*);
+the preprocessor is unit-tested for *whether the right config knob fires for
 the right (parser, request) pair* (PRE.\*). Most preprocessor bugs are
 "forgot to add parser X to the truth table" — a parser ships, the
 preprocessor doesn't know about it, the new path silently runs with a

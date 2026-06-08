@@ -24,6 +24,42 @@ pub mod jail;
 pub use aggregator::DeltaAggregator;
 pub use delta::DeltaGenerator;
 
+use dynamo_parsers::tool_calling::{ToolCallResponse, ToolCallResponseChunk};
+use dynamo_protocols::types::{
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, FunctionCall,
+    FunctionCallStream, FunctionType,
+};
+
+/// Map a parser-native [`ToolCallResponse`] onto the OpenAI wire type.
+pub(crate) fn tool_call_response_to_protocol(
+    parsed: ToolCallResponse,
+) -> ChatCompletionMessageToolCall {
+    ChatCompletionMessageToolCall {
+        id: parsed.id,
+        r#type: FunctionType::Function,
+        function: FunctionCall {
+            name: parsed.function.name,
+            arguments: parsed.function.arguments,
+        },
+    }
+}
+
+/// Map a parser-native [`ToolCallResponseChunk`] onto the OpenAI wire type.
+#[allow(dead_code)]
+pub(crate) fn tool_call_response_chunk_to_protocol(
+    parsed: ToolCallResponseChunk,
+) -> ChatCompletionMessageToolCallChunk {
+    ChatCompletionMessageToolCallChunk {
+        index: parsed.index,
+        id: parsed.id,
+        r#type: parsed.tp.map(|_| FunctionType::Function),
+        function: parsed.function.map(|f| FunctionCallStream {
+            name: f.name,
+            arguments: f.arguments,
+        }),
+    }
+}
+
 /// A request structure for creating a chat completion, extending OpenAI's
 /// `CreateChatCompletionRequest` with [`NvExt`] extensions and common fields.
 ///

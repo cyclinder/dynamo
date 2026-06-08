@@ -1614,6 +1614,7 @@ impl OpenAIPreprocessor {
                 .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
                     name: tool.function.name.clone(),
                     parameters: tool.function.parameters.clone(),
+                    strict: tool.function.strict,
                 })
                 .collect()
         });

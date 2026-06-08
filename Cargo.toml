@@ -18,7 +18,6 @@ members = [
     "lib/kvbm-logical",
     "lib/kvbm-physical",
     "lib/protocols",
-    "lib/parsers",
     "lib/bench",
     "lib/backend-common",
     "lib/backend-common/examples/mocker",
@@ -48,7 +47,7 @@ dynamo-memory = { path = "lib/memory", version = "1.2.1" }
 dynamo-mocker = { path = "lib/mocker", version = "1.2.1" }
 dynamo-kv-router = { path = "lib/kv-router", version = "1.2.1", features = ["metrics", "runtime-protocols"] }
 dynamo-protocols = { path = "lib/protocols", version = "1.2.1" }
-dynamo-parsers = { path = "lib/parsers", version = "1.2.1" }
+dynamo-parsers = { version = "1.4.1" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.2.1" }
 fastokens = { version = "0.1.0" }
 

@@ -17,6 +17,14 @@ use crate::protocols::{
 use dynamo_protocols::types::ChatCompletionMessageContent;
 use dynamo_runtime::engine::DataStream;
 
+fn is_harmony_parser(parser: &str) -> bool {
+    parser == "harmony"
+}
+
+fn contains_harmony_protocol(text: &str) -> bool {
+    text.contains("<|channel|>")
+}
+
 /// Aggregates a stream of [`NvCreateChatCompletionStreamResponse`]s into a single
 /// [`NvCreateChatCompletionResponse`]. This struct accumulates incremental responses
 /// from a streaming OpenAI API call into a complete final response.
@@ -382,7 +390,14 @@ impl DeltaAggregator {
                     };
 
                 if !tool_calls.is_empty() {
-                    choice.tool_calls = Some(tool_calls);
+                    choice.tool_calls = Some(
+                        tool_calls
+                            .into_iter()
+                            .map(super::tool_call_response_to_protocol)
+                            .collect(),
+                    );
+                    choice.text = content.unwrap_or_default();
+                } else if is_harmony_parser(parser) && contains_harmony_protocol(&choice.text) {
                     choice.text = content.unwrap_or_default();
                 }
             }

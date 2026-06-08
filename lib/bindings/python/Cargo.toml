@@ -39,7 +39,7 @@ lightseek-mm = ["dynamo-llm/lightseek-mm"]
 [dependencies]
 dynamo-runtime = { path = "../../runtime" }
 dynamo-mocker = { path = "../../mocker" }
-dynamo-parsers = { path = "../../parsers" }
+dynamo-parsers = { version = "1.4.1" }
 dynamo-backend-common = { path = "../../backend-common" }
 
 anyhow = { version = "1" }
