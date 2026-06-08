@@ -90,7 +90,7 @@ impl StickySessionCoordinator {
         &self,
         request: &PreprocessedRequest,
         worker: WorkerWithDpRank,
-        context_id: &str,
+        _context_id: &str,
     ) -> Result<SessionRoutingResult> {
         let sc = request
             .routing
@@ -110,13 +110,10 @@ impl StickySessionCoordinator {
 
         match action {
             SessionAction::Open => {
-                let opened = self
-                    .lifecycle
-                    .open_session(&sc.session_id, sc.timeout, worker.worker_id, context_id)
-                    .await?;
-                if opened {
-                    self.bind_with_kind(sc, worker, AffinityKind::EngineBacked);
-                }
+                // Radix-native sessions need no engine open: the first tagged
+                // generate creates the KV. Just bind affinity; Close still fires
+                // the release RPC (EngineBacked binding).
+                self.bind_with_kind(sc, worker, AffinityKind::EngineBacked);
                 Ok(SessionRoutingResult {
                     deferred_close: None,
                 })
