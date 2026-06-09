@@ -32,7 +32,7 @@ TRANSIENT_K8S_EXCEPTIONS = (
 DGD_PLURAL = "dynamographdeployments"
 CHECKPOINT_PLURAL = "dynamocheckpoints"
 
-DECODE_COMPONENT = "VllmDecodeWorker"
+DECODE_COMPONENT = "decode"
 FRONTEND_COMPONENT = "Frontend"
 TARGET_CONTAINER = "main"
 VLLM_MODEL = "Qwen/Qwen3-0.6B"
