@@ -872,14 +872,22 @@ def auto_inject_trust_remote_code(
     flag are skipped. ``Frontend`` and ``Planner`` services are skipped
     (same exclusion list as ``apply_dgd_overrides``). Returns the list of
     service names that were modified.
+
+    Per-service model detection: if a worker's ``mainContainer.args`` contains
+    ``--model <path>``, that path overrides the *model_name_or_path* fallback
+    for that service's ``auto_map`` check.  This ensures correctness when
+    ``apply_dgd_overrides`` has swapped the model in specific workers.
+
+    Shell-form workers (``command: ["sh", "-c"]`` with a single-string args)
+    are handled correctly: the flag is appended inside the shell string rather
+    than as a second list element (which would become ``$0`` and break the
+    worker).
     """
     # Local import to keep ``protocol`` free of a hard dep on model_info,
     # which pulls in ``transformers``/``huggingface_hub``.
     from dynamo.profiler.utils.model_info import model_has_auto_map
 
     if backend not in _TRUST_REMOTE_CODE_BACKENDS:
-        return []
-    if not model_has_auto_map(model_name_or_path, token=hf_token):
         return []
 
     services = config.get("spec", {}).get("services", {})
@@ -893,18 +901,58 @@ def auto_inject_trust_remote_code(
         main_container = extra_pod_spec.get("mainContainer")
         if not isinstance(main_container, dict):
             continue
+
         args = main_container.get("args") or []
-        if _TRUST_REMOTE_CODE_FLAG in args:
+        cmd = main_container.get("command") or []
+
+        # Detect shell form: command=["sh","-c"] with a single-string args list.
+        # Appending a second element to shell-form args would make the new entry
+        # become $0 inside the shell, not an actual flag.
+        is_shell_c = (
+            isinstance(cmd, list)
+            and len(cmd) >= 2
+            and cmd[0] in ("/bin/sh", "sh")
+            and cmd[1] == "-c"
+        )
+        is_single_string_args = (
+            isinstance(args, list) and len(args) == 1 and isinstance(args[0], str)
+        )
+
+        # Break args to tokens for idempotency check and --model extraction.
+        # break_arguments handles both list-form and the shell-form single-string.
+        tokens = break_arguments(args)
+
+        # Idempotency: skip this service if flag is already present.
+        if _TRUST_REMOTE_CODE_FLAG in tokens:
             continue
-        main_container["args"] = list(args) + [_TRUST_REMOTE_CODE_FLAG]
+
+        # Per-service model: prefer the --model arg in this container's args so
+        # that overrides which swap the model path are detected correctly.
+        effective_model = model_name_or_path
+        try:
+            model_idx = tokens.index("--model")
+            if model_idx + 1 < len(tokens):
+                effective_model = tokens[model_idx + 1]
+        except ValueError:
+            pass
+
+        if not model_has_auto_map(effective_model, token=hf_token):
+            continue
+
+        # Inject the flag, preserving the shell-form shape when necessary.
+        if is_shell_c and is_single_string_args:
+            import shlex
+
+            main_container["args"] = [shlex.join(tokens + [_TRUST_REMOTE_CODE_FLAG])]
+        else:
+            main_container["args"] = list(args) + [_TRUST_REMOTE_CODE_FLAG]
         modified.append(svc_name)
 
     if modified:
         logger.info(
-            "Auto-injected %s on worker(s) %s: HF model %r declares `auto_map` "
+            "Auto-injected %s on worker(s) %s: HF model declares `auto_map` "
             "(ships custom Python).",
             _TRUST_REMOTE_CODE_FLAG,
             modified,
-            model_name_or_path,
         )
     return modified

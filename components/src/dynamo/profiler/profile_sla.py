@@ -427,6 +427,15 @@ async def run_profile(
                 len(job_tolerations),
             )
 
+        # Auto-inject --trust-remote-code into the selected disaggregated config
+        # used for interpolation sweeps. Must run after DGD overrides and
+        # tolerations; uses per-service --model extraction so override-swapped
+        # models are detected correctly.
+        if dgd_config:
+            auto_inject_trust_remote_code(
+                dgd_config, resolve_model_path(dgdr), resolved_backend
+            )
+
         # ---------------------------------------------------------------
         # Interpolation curves — only needed when something consumes the
         # per-engine performance data on disk (thorough-mode planner or
@@ -543,6 +552,9 @@ async def run_profile(
         # Auto-inject --trust-remote-code for HF models that ship custom
         # Python (`auto_map` in config.json). Runs after user overrides so
         # an explicit override wins and we don't duplicate the flag.
+        # The injector uses per-service --model extraction so an
+        # override-swapped model path is detected correctly; resolve_model_path
+        # is used only as a fallback.
         if final_config:
             trc_target = (
                 final_config[-1] if isinstance(final_config, list) else final_config
