@@ -206,13 +206,20 @@ fn mdc_blobs_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-fn mdc_slug_dir(slug: &Slug, mdcsum: &str) -> anyhow::Result<PathBuf> {
-    let dir = mdc_cache_root()
+/// Per-MDC cache directory: `<root>/by-slug/<slug>/<mdcsum>/`.
+/// Pure path computation; use [`mdc_local_dir`] when you need the
+/// directory created.
+fn mdc_local_path(slug: &Slug, mdcsum: &str) -> PathBuf {
+    mdc_cache_root()
         .join("by-slug")
         .join(slug.to_string())
-        .join(mdcsum);
+        .join(mdcsum)
+}
+
+fn mdc_local_dir(slug: &Slug, mdcsum: &str) -> anyhow::Result<PathBuf> {
+    let dir = mdc_local_path(slug, mdcsum);
     std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating MDC slug dir {}", dir.display()))?;
+        .with_context(|| format!("creating MDC local dir {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -336,9 +343,9 @@ fn file_uri_parent(uri: &str) -> Option<PathBuf> {
     parent.is_dir().then(|| parent.to_path_buf())
 }
 
-/// Symlink non-weight files from `snapshot_dir` into `slug_dir`. Picks up
+/// Symlink non-weight files from `snapshot_dir` into `local_dir`. Picks up
 /// `preprocessor_config.json` and other sibling files that
-/// `from_pretrained(slug_dir)` consumers need.
+/// `from_pretrained(local_dir)` consumers need.
 ///
 /// Names in `typed_filenames` are owned by the resolve loop's typed-slot
 /// pass — never overwritten. Every other harvested sibling is re-linked
@@ -347,7 +354,7 @@ fn file_uri_parent(uri: &str) -> Option<PathBuf> {
 /// cover harvested files).
 fn harvest_siblings(
     snapshot_dir: &Path,
-    slug_dir: &Path,
+    local_dir: &Path,
     typed_filenames: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(snapshot_dir) {
@@ -374,7 +381,7 @@ fn harvest_siblings(
         if typed_filenames.contains(&name) {
             continue;
         }
-        let dst = slug_dir.join(&name);
+        let dst = local_dir.join(&name);
         // Resolve through the canonical target so a downstream
         // `canonicalize` lands on a stable blob path rather than
         // chasing snapshot-dir symlinks. `symlink_force` is idempotent
@@ -385,7 +392,7 @@ fn harvest_siblings(
         tracing::debug!(
             file = %name,
             target = %target.display(),
-            "harvested sibling into slug_dir",
+            "harvested sibling into local_dir",
         );
     }
     Ok(())
@@ -774,6 +781,14 @@ impl ModelDeploymentCard {
         Ok(serde_json::to_string(self)?)
     }
 
+    /// Per-MDC resolve directory. After `download_config` runs, every
+    /// typed slot + harvested sibling is symlinked here for
+    /// `from_pretrained(local_dir)` consumers. Pure path — does not
+    /// create the directory; the resolve pipeline owns that.
+    pub fn local_dir(&self) -> PathBuf {
+        mdc_local_path(&self.slug, self.mdcsum())
+    }
+
     pub fn mdcsum(&self) -> &str {
         self.checksum
             .get_or_init(|| {
@@ -801,6 +816,23 @@ impl ModelDeploymentCard {
                 }
                 if let Some(gen_config) = self.gen_config.as_ref() {
                     bytes_to_hash.extend(gen_config.checksum().as_bytes());
+                }
+
+                // extra_files: hash sorted (basename, checksum) pairs so
+                // (a) workers with identical siblings produce the same
+                // mdcsum regardless of `read_dir` order, and (b) the same
+                // bytes under different filenames don't collide — otherwise
+                // the frontend cache could serve a local_dir missing siblings.
+                let mut extras: Vec<(&str, &str)> = self
+                    .extra_files
+                    .iter()
+                    .map(|cf| (cf.basename().unwrap_or(""), cf.checksum().hash()))
+                    .collect();
+                extras.sort_unstable();
+                for (name, h) in &extras {
+                    bytes_to_hash.extend(name.as_bytes());
+                    bytes_to_hash.push(0);
+                    bytes_to_hash.extend(h.as_bytes());
                 }
 
                 if let Some(prompt_context_vec) = self.prompt_context.as_ref() {
@@ -1015,7 +1047,7 @@ impl ModelDeploymentCard {
         let source = self.source_path().to_string();
         let mdcsum = self.mdcsum().to_string();
         let blobs = mdc_blobs_dir()?;
-        let slug_dir = mdc_slug_dir(&self.slug, &mdcsum)?;
+        let local_dir = mdc_local_dir(&self.slug, &mdcsum)?;
 
         let entries: Vec<(String, CheckedFile)> = self
             .iter_metadata_files()
@@ -1057,7 +1089,7 @@ impl ModelDeploymentCard {
             let blob = blobs.join(blake3_hex);
             tracing::debug!(filename = %filename, uri = %uri, blake3 = %blake3_hex, "resolving");
             resolve_uri(&client, uri, expected, &blob, &hf_snapshots).await?;
-            symlink_force(&blob, &slug_dir.join(&filename))?;
+            symlink_force(&blob, &local_dir.join(&filename))?;
         }
         tracing::debug!(
             display_name = %self.display_name,
@@ -1081,13 +1113,13 @@ impl ModelDeploymentCard {
             }
         }
         for snap in &snapshot_dirs {
-            harvest_siblings(snap, &slug_dir, &typed_filenames)?;
+            harvest_siblings(snap, &local_dir, &typed_filenames)?;
         }
 
         // Pass 3: rewrite cf.path to the cache symlink so downstream
         // tokenizer/config loaders read from a verified location.
         for (cf, _) in self.iter_metadata_files_mut() {
-            cf.update_dir(&slug_dir);
+            cf.update_dir(&local_dir);
         }
         Ok(())
     }
@@ -1788,7 +1820,7 @@ fn check_valid_local_repo_path(path: impl AsRef<Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::HFConfig;
+    use super::{HFConfig, ModelDeploymentCard};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
@@ -2057,7 +2089,7 @@ mod tests {
 
             // Sibling harvest: TinyLlama_v1.1 fixture ships
             // `special_tokens_map.json` and `tokenizer.model` outside the
-            // typed slots — both must land in slug_dir for
+            // typed slots — both must land in local_dir for
             // `from_pretrained()` to see a complete model dir.
             assert!(snap.join("special_tokens_map.json").exists());
             assert!(snap.join("tokenizer.model").exists());
@@ -2081,6 +2113,36 @@ mod tests {
             "size": 1u64,
         }))
         .unwrap()
+    }
+
+    /// Two MDCs with `extra_files` that share bytes but differ in basename
+    /// must produce distinct mdcsums — otherwise the frontend cache would
+    /// alias them and a local_dir built from one worker's harvest would be
+    /// reused for another worker that needs a differently-named sibling.
+    #[test]
+    fn mdcsum_extras_distinguish_basename_at_equal_checksum() {
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample-models/TinyLlama_v1.1");
+        let mut a = super::ModelDeploymentCard::load_from_disk(&src, None).unwrap();
+        let mut b = super::ModelDeploymentCard::load_from_disk(&src, None).unwrap();
+        a.extra_files.push(cf_for("/m/preprocessor_config.json"));
+        b.extra_files.push(cf_for("/m/image_processor_config.json"));
+        assert_ne!(a.mdcsum(), b.mdcsum());
+    }
+
+    /// Read-order independence: extras pushed in different order must
+    /// hash the same (sort_unstable on (basename, checksum) pairs).
+    #[test]
+    fn mdcsum_extras_stable_across_read_order() {
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample-models/TinyLlama_v1.1");
+        let mut a = super::ModelDeploymentCard::load_from_disk(&src, None).unwrap();
+        let mut b = super::ModelDeploymentCard::load_from_disk(&src, None).unwrap();
+        let cf1 = cf_for("/m/a.json");
+        let cf2 = cf_for("/m/b.json");
+        a.extra_files.extend([cf1.clone(), cf2.clone()]);
+        b.extra_files.extend([cf2, cf1]);
+        assert_eq!(a.mdcsum(), b.mdcsum());
     }
 
     #[test]
@@ -2108,6 +2170,18 @@ mod tests {
         assert_eq!(
             got,
             url::Url::from_file_path(&local_cfg).unwrap().to_string()
+        );
+    }
+
+    #[test]
+    fn local_dir_computes_expected_path() {
+        // Sentinel for cache-layout drift: the public `local_dir()` must
+        // stay in lockstep with `mdc_local_path`. Resolve-pipeline
+        // integration is covered by the vllm/sglang serve tests.
+        let card = ModelDeploymentCard::with_name_only("Qwen/Qwen3-0.6B");
+        assert_eq!(
+            card.local_dir(),
+            super::mdc_local_path(card.slug(), card.mdcsum())
         );
     }
 
@@ -2223,7 +2297,7 @@ mod tests {
         let snap = tempfile::tempdir()?;
         let slug = tempfile::tempdir()?;
 
-        // Typed slot: blob in the dynamo cache; slug_dir links to it.
+        // Typed slot: blob in the dynamo cache; local_dir links to it.
         let typed_blob = blob_dir.path().join("config-blob");
         std::fs::write(&typed_blob, b"typed-slot-content")?;
         super::symlink_force(&typed_blob, &slug.path().join("config.json"))?;

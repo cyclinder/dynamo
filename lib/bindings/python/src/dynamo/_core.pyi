@@ -495,6 +495,15 @@ class ModelDeploymentCard:
         """Return the source path of this deployment card."""
         ...
 
+    def local_dir(self) -> str:
+        """Resolved metadata directory (post-`download_config`). Raises
+        ValueError if the path contains non-UTF-8 bytes."""
+        ...
+
+    def name(self) -> str:
+        """Return the model name."""
+        ...
+
     def runtime_config(self) -> Any:
         """Return the runtime configuration as a dict."""
         ...
