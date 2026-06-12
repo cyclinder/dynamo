@@ -178,6 +178,7 @@ STUB_MODULES = [
     "sglang.srt.function_call.utils",
     "sglang.srt.parser",
     "sglang.srt.parser.conversation",
+    "sglang.srt.parser.jinja_template_utils",
     "sglang.srt.parser.reasoning_parser",
     "sglang.srt.utils",
     "sglang.srt.utils.hf_transformers_utils",
