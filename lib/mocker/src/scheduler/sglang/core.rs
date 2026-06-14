@@ -211,21 +211,18 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
         // Capture per-request prefill FPM data before dispersing can_run.
         let prefill_fpm = admit.prefill_fpm;
 
-        let batch_size = admit.can_run.len();
-        let mean_isl = if batch_size > 0 {
-            admit.total_isl / batch_size
-        } else {
-            0
-        };
-        let mean_prefix = if batch_size > 0 {
-            admit.total_prefix / batch_size
-        } else {
-            0
-        };
+        let prefill_sequence_lengths = admit
+            .can_run
+            .iter()
+            .map(|request| request.materialized_tokens)
+            .collect::<Vec<_>>();
+        let prefill_prefix_lengths = prefill_fpm
+            .iter()
+            .map(|item| item.prefix_tokens)
+            .collect::<Vec<_>>();
         let prefill_time = simulate_prefill_duration(
-            batch_size,
-            mean_isl,
-            mean_prefix,
+            &prefill_sequence_lengths,
+            &prefill_prefix_lengths,
             &self.config,
             self.latency_model.as_ref(),
             true,
@@ -356,23 +353,21 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
 }
 
 fn simulate_prefill_duration<M: ReplayLatencyModel>(
-    batch_size: usize,
-    mean_isl: usize,
-    mean_prefix: usize,
+    sequence_lengths: &[usize],
+    prefix_lengths: &[usize],
     config: &SglangConfig,
     latency_model: &M,
     apply_speedup: bool,
 ) -> Duration {
-    if batch_size == 0 || config.worker_type == WorkerType::Decode {
+    if sequence_lengths.is_empty() || config.worker_type == WorkerType::Decode {
         return Duration::ZERO;
     }
 
     let prefill_time = normalize_replay_latency_ms(
-        latency_model.prefill_latency_ms(ReplayPrefillInput {
-            batch_size,
-            input_sequence_length: mean_isl,
-            prefix_length: mean_prefix,
-        }),
+        latency_model.prefill_latency_ms(
+            ReplayPrefillInput::new(sequence_lengths, prefix_lengths)
+                .expect("SGLang prefill batch must contain valid request shapes"),
+        ),
         0.0,
         "prefill",
     );

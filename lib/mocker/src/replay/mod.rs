@@ -203,78 +203,148 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedPrefillInput {
+        sequence_lengths: Vec<usize>,
+        prefix_lengths: Vec<usize>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedDecodeInput {
+        sequence_lengths: Vec<usize>,
+        active_kv_tokens: usize,
+        total_kv_tokens: usize,
+        output_length: usize,
+    }
+
     #[derive(Clone, Default)]
     struct RecordingLatencyModel {
-        prefill_inputs: Arc<Mutex<Vec<ReplayPrefillInput>>>,
-        decode_inputs: Arc<Mutex<Vec<ReplayDecodeInput>>>,
+        prefill_inputs: Arc<Mutex<Vec<RecordedPrefillInput>>>,
+        decode_inputs: Arc<Mutex<Vec<RecordedDecodeInput>>>,
     }
 
     impl ReplayLatencyModel for RecordingLatencyModel {
-        fn prefill_latency_ms(&self, input: ReplayPrefillInput) -> f64 {
-            self.prefill_inputs.lock().unwrap().push(input);
+        fn prefill_latency_ms(&self, input: ReplayPrefillInput<'_>) -> f64 {
+            self.prefill_inputs
+                .lock()
+                .unwrap()
+                .push(RecordedPrefillInput {
+                    sequence_lengths: input.sequence_lengths.to_vec(),
+                    prefix_lengths: input.prefix_lengths.to_vec(),
+                });
             2.0
         }
 
-        fn decode_latency_ms(&self, input: ReplayDecodeInput) -> f64 {
-            self.decode_inputs.lock().unwrap().push(input);
+        fn decode_latency_ms(&self, input: ReplayDecodeInput<'_>) -> f64 {
+            self.decode_inputs
+                .lock()
+                .unwrap()
+                .push(RecordedDecodeInput {
+                    sequence_lengths: input.sequence_lengths.to_vec(),
+                    active_kv_tokens: input.active_kv_tokens,
+                    total_kv_tokens: input.total_kv_tokens,
+                    output_length: input.output_length,
+                });
             1.0
         }
     }
 
-    #[test]
-    fn generic_replay_uses_native_latency_model() {
-        let model = RecordingLatencyModel::default();
-        let replay = Replay::new(model.clone());
-        let args = MockEngineArgs::builder()
-            .block_size(16)
+    fn replay_args(engine_type: crate::common::protocols::EngineType) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(engine_type)
+            .block_size(4)
             .num_gpu_blocks(128)
+            .max_num_batched_tokens(Some(64))
+            .max_num_seqs(Some(4))
+            .enable_prefix_caching(true)
+            .speedup_ratio(0.0)
             .build()
-            .unwrap();
-        let requests = vec![
-            DirectRequest {
-                tokens: vec![1; 8],
-                max_output_tokens: 2,
-                uuid: Some(Uuid::from_u128(1)),
-                dp_rank: 0,
-                arrival_timestamp_ms: Some(0.0),
-                priority: 0,
-                strict_priority: 0,
-            },
-            DirectRequest {
-                tokens: vec![2; 12],
-                max_output_tokens: 2,
-                uuid: Some(Uuid::from_u128(2)),
-                dp_rank: 0,
-                arrival_timestamp_ms: Some(0.0),
-                priority: 0,
-                strict_priority: 0,
-            },
-        ];
+            .unwrap()
+    }
 
-        let report = replay
-            .simulate_trace_requests(
-                args,
-                None,
-                None,
-                requests,
-                2,
-                1.0,
-                ReplayRouterMode::RoundRobin,
-            )
-            .unwrap();
+    fn replay_request(uuid: u128, tokens: Vec<u32>, arrival_timestamp_ms: f64) -> DirectRequest {
+        DirectRequest {
+            tokens,
+            max_output_tokens: 2,
+            uuid: Some(Uuid::from_u128(uuid)),
+            dp_rank: 0,
+            arrival_timestamp_ms: Some(arrival_timestamp_ms),
+            priority: 0,
+            strict_priority: 0,
+        }
+    }
 
-        assert_eq!(report.request_counts.completed_requests, 2);
-        let prefill_inputs = model.prefill_inputs.lock().unwrap();
-        assert!(!prefill_inputs.is_empty());
-        assert!(prefill_inputs.iter().all(|input| {
-            input.input_sequence_length >= input.prefix_length
-                && input.effective_input_sequence_length() > 0
-        }));
-        let decode_inputs = model.decode_inputs.lock().unwrap();
-        assert!(!decode_inputs.is_empty());
-        assert!(decode_inputs.iter().all(|input| {
-            input.batch_size > 0 && input.context_length > 0 && input.output_length == 2
-        }));
+    #[test]
+    fn generic_replay_preserves_heterogeneous_request_shapes() {
+        for engine_type in [
+            crate::common::protocols::EngineType::Vllm,
+            crate::common::protocols::EngineType::Sglang,
+        ] {
+            let model = RecordingLatencyModel::default();
+            let replay = Replay::new(model.clone());
+            let report = replay
+                .simulate_trace_requests(
+                    replay_args(engine_type),
+                    None,
+                    None,
+                    vec![
+                        replay_request(1, vec![1; 8], 0.0),
+                        replay_request(2, vec![2; 12], 0.0),
+                    ],
+                    1,
+                    1.0,
+                    ReplayRouterMode::RoundRobin,
+                )
+                .unwrap();
+
+            assert_eq!(report.request_counts.completed_requests, 2);
+            assert!(model.prefill_inputs.lock().unwrap().iter().any(|input| {
+                input.sequence_lengths == [8, 12] && input.prefix_lengths == [0, 0]
+            }));
+            assert!(
+                model
+                    .decode_inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|input| { input.sequence_lengths == [8, 12] && input.output_length == 2 })
+            );
+        }
+    }
+
+    #[test]
+    fn generic_replay_preserves_cached_prefix_lengths() {
+        for engine_type in [
+            crate::common::protocols::EngineType::Vllm,
+            crate::common::protocols::EngineType::Sglang,
+        ] {
+            let model = RecordingLatencyModel::default();
+            let replay = Replay::new(model.clone());
+            let report = replay
+                .simulate_trace_requests(
+                    replay_args(engine_type),
+                    None,
+                    None,
+                    vec![
+                        replay_request(1, vec![1, 1, 1, 1, 2, 2, 2, 2], 0.0),
+                        replay_request(2, vec![1, 1, 1, 1, 3, 3, 3, 3], 100.0),
+                    ],
+                    1,
+                    1.0,
+                    ReplayRouterMode::RoundRobin,
+                )
+                .unwrap();
+
+            assert_eq!(report.request_counts.completed_requests, 2);
+            assert!(
+                model
+                    .prefill_inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|input| { input.sequence_lengths == [8] && input.prefix_lengths == [4] })
+            );
+        }
     }
 
     #[test]

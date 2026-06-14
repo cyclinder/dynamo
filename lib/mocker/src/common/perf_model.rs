@@ -17,25 +17,62 @@ use std::sync::Arc;
 
 /// Inputs for one replay prefill latency prediction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplayPrefillInput {
-    pub batch_size: usize,
-    pub input_sequence_length: usize,
-    pub prefix_length: usize,
+pub struct ReplayPrefillInput<'a> {
+    pub sequence_lengths: &'a [usize],
+    pub prefix_lengths: &'a [usize],
 }
 
-impl ReplayPrefillInput {
-    pub fn effective_input_sequence_length(self) -> usize {
-        self.input_sequence_length
-            .saturating_sub(self.prefix_length)
+impl<'a> ReplayPrefillInput<'a> {
+    pub fn new(sequence_lengths: &'a [usize], prefix_lengths: &'a [usize]) -> Result<Self> {
+        if sequence_lengths.is_empty() {
+            anyhow::bail!("replay prefill input requires at least one request");
+        }
+        if sequence_lengths.len() != prefix_lengths.len() {
+            anyhow::bail!(
+                "replay prefill input length mismatch: sequence_lengths={}, prefix_lengths={}",
+                sequence_lengths.len(),
+                prefix_lengths.len()
+            );
+        }
+        if let Some((index, (prefix, sequence))) = prefix_lengths
+            .iter()
+            .zip(sequence_lengths)
+            .enumerate()
+            .find(|(_, (prefix, sequence))| prefix > sequence)
+        {
+            anyhow::bail!(
+                "replay prefill prefix length exceeds sequence length at index {index}: prefix={prefix}, sequence={sequence}"
+            );
+        }
+        Ok(Self {
+            sequence_lengths,
+            prefix_lengths,
+        })
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.sequence_lengths.len()
+    }
+
+    pub fn avg_sequence_length(&self) -> usize {
+        average_length(self.sequence_lengths)
+    }
+
+    pub fn avg_prefix_length(&self) -> usize {
+        average_length(self.prefix_lengths)
+    }
+
+    pub fn avg_effective_input_length(&self) -> usize {
+        self.avg_sequence_length()
+            .saturating_sub(self.avg_prefix_length())
     }
 }
 
 /// Inputs for one replay decode latency prediction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplayDecodeInput {
-    pub batch_size: usize,
+pub struct ReplayDecodeInput<'a> {
+    pub sequence_lengths: &'a [usize],
     pub active_kv_tokens: usize,
-    pub context_length: usize,
     pub total_kv_tokens: usize,
     /// Sequence length passed to models that predict generation latency from
     /// an input/output pair. Replay requests one newly generated token by
@@ -43,13 +80,30 @@ pub struct ReplayDecodeInput {
     pub output_length: usize,
 }
 
+impl ReplayDecodeInput<'_> {
+    pub fn batch_size(&self) -> usize {
+        self.sequence_lengths.len()
+    }
+
+    pub fn avg_context_length(&self) -> usize {
+        average_length(self.sequence_lengths)
+    }
+}
+
+fn average_length(lengths: &[usize]) -> usize {
+    if lengths.is_empty() {
+        return 0;
+    }
+    lengths.iter().sum::<usize>() / lengths.len()
+}
+
 /// Latency model used by replay schedulers.
 ///
 /// Implementations may call a local model, cross an FFI boundary, or use any
 /// other transport. Returned values are milliseconds.
 pub trait ReplayLatencyModel: Send + Sync {
-    fn prefill_latency_ms(&self, input: ReplayPrefillInput) -> f64;
-    fn decode_latency_ms(&self, input: ReplayDecodeInput) -> f64;
+    fn prefill_latency_ms(&self, input: ReplayPrefillInput<'_>) -> f64;
+    fn decode_latency_ms(&self, input: ReplayDecodeInput<'_>) -> f64;
 }
 
 pub(crate) fn normalize_replay_latency_ms(
@@ -269,11 +323,7 @@ impl PerfModel {
 
     /// Predict prefill time in milliseconds.
     pub fn predict_prefill_time(&self, batch_size: usize, isl: usize, prefix: usize) -> f64 {
-        self.prefill_latency_ms(ReplayPrefillInput {
-            batch_size,
-            input_sequence_length: isl,
-            prefix_length: prefix,
-        })
+        self.predict_prefill_aggregates(batch_size, isl.saturating_sub(prefix), prefix)
     }
 
     /// Predict decode time in milliseconds.
@@ -284,43 +334,52 @@ impl PerfModel {
         context_length: usize,
         total_kv_tokens: usize,
     ) -> f64 {
-        self.decode_latency_ms(ReplayDecodeInput {
+        self.predict_decode_aggregates(
             batch_size,
             active_kv_tokens,
             context_length,
             total_kv_tokens,
-            output_length: 2,
-        })
+            2,
+        )
     }
-}
 
-impl ReplayLatencyModel for PerfModel {
-    fn prefill_latency_ms(&self, input: ReplayPrefillInput) -> f64 {
-        let new_tokens_per_req = input.effective_input_sequence_length();
+    fn predict_prefill_aggregates(
+        &self,
+        batch_size: usize,
+        avg_effective_input_length: usize,
+        avg_prefix_length: usize,
+    ) -> f64 {
         let time = match self {
             PerfModel::Polynomial => {
-                let tokens = (input.batch_size * new_tokens_per_req) as f64;
+                let tokens = (batch_size * avg_effective_input_length) as f64;
                 4.209989e-07 * tokens.powi(2) + 1.518344e-02 * tokens + 1.650142e+01
             }
             PerfModel::Interpolated { prefill_interp, .. } => {
-                let tokens = (input.batch_size * new_tokens_per_req) as f64;
+                let tokens = (batch_size * avg_effective_input_length) as f64;
                 prefill_interp.interp(tokens).unwrap_or(0.0)
             }
             PerfModel::Aiconfigurator { callback } => {
-                callback.predict_prefill(input.batch_size, new_tokens_per_req, input.prefix_length)
+                callback.predict_prefill(batch_size, avg_effective_input_length, avg_prefix_length)
             }
         };
         time.max(0.0)
     }
 
-    fn decode_latency_ms(&self, input: ReplayDecodeInput) -> f64 {
-        if input.batch_size == 0 {
+    fn predict_decode_aggregates(
+        &self,
+        batch_size: usize,
+        active_kv_tokens: usize,
+        avg_context_length: usize,
+        total_kv_tokens: usize,
+        output_length: usize,
+    ) -> f64 {
+        if batch_size == 0 {
             return 0.0;
         }
         let time = match self {
             PerfModel::Polynomial => {
-                let active_perc = if input.total_kv_tokens > 0 {
-                    input.active_kv_tokens as f64 / input.total_kv_tokens as f64
+                let active_perc = if total_kv_tokens > 0 {
+                    active_kv_tokens as f64 / total_kv_tokens as f64
                 } else {
                     tracing::warn!("Total KV tokens is 0, using 1.0 as capacity");
                     1.0
@@ -328,20 +387,112 @@ impl ReplayLatencyModel for PerfModel {
                 -25.74 * active_perc.powi(2) + 54.01 * active_perc + 5.74
             }
             PerfModel::Interpolated { decode_interp, .. } => decode_interp
-                .interp(input.active_kv_tokens as f64, input.context_length as f64)
+                .interp(active_kv_tokens as f64, avg_context_length as f64)
                 .unwrap_or(0.0),
             PerfModel::Aiconfigurator { callback } => {
-                callback.predict_decode(input.batch_size, input.context_length, input.output_length)
+                callback.predict_decode(batch_size, avg_context_length, output_length)
             }
         };
         let result = time.max(1.0);
         tracing::trace!(
-            batch_size = input.batch_size,
-            active_kv_tokens = input.active_kv_tokens,
-            context_length = input.context_length,
+            batch_size,
+            active_kv_tokens,
+            avg_context_length,
             time_ms = result,
             "Decode time prediction"
         );
         result
+    }
+}
+
+impl ReplayLatencyModel for PerfModel {
+    fn prefill_latency_ms(&self, input: ReplayPrefillInput<'_>) -> f64 {
+        self.predict_prefill_aggregates(
+            input.batch_size(),
+            input.avg_effective_input_length(),
+            input.avg_prefix_length(),
+        )
+    }
+
+    fn decode_latency_ms(&self, input: ReplayDecodeInput<'_>) -> f64 {
+        self.predict_decode_aggregates(
+            input.batch_size(),
+            input.active_kv_tokens,
+            input.avg_context_length(),
+            input.total_kv_tokens,
+            input.output_length,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingAicCallback {
+        prefill_calls: Mutex<Vec<(usize, usize, usize)>>,
+        decode_calls: Mutex<Vec<(usize, usize, usize)>>,
+    }
+
+    impl AicCallback for RecordingAicCallback {
+        fn predict_prefill(&self, batch_size: usize, effective_isl: usize, prefix: usize) -> f64 {
+            self.prefill_calls
+                .lock()
+                .unwrap()
+                .push((batch_size, effective_isl, prefix));
+            2.0
+        }
+
+        fn predict_decode(&self, batch_size: usize, isl: usize, osl: usize) -> f64 {
+            self.decode_calls
+                .lock()
+                .unwrap()
+                .push((batch_size, isl, osl));
+            1.0
+        }
+    }
+
+    #[test]
+    fn replay_prefill_input_validates_request_shapes() {
+        assert!(ReplayPrefillInput::new(&[], &[]).is_err());
+        assert!(ReplayPrefillInput::new(&[8, 12], &[0]).is_err());
+        assert!(ReplayPrefillInput::new(&[8, 12], &[0, 13]).is_err());
+    }
+
+    #[test]
+    fn replay_inputs_derive_legacy_averages_from_exact_lengths() {
+        let prefill = ReplayPrefillInput::new(&[8, 13], &[4, 5]).unwrap();
+        assert_eq!(prefill.batch_size(), 2);
+        assert_eq!(prefill.avg_sequence_length(), 10);
+        assert_eq!(prefill.avg_prefix_length(), 4);
+        assert_eq!(prefill.avg_effective_input_length(), 6);
+
+        let decode = ReplayDecodeInput {
+            sequence_lengths: &[9, 14],
+            active_kv_tokens: 23,
+            total_kv_tokens: 128,
+            output_length: 2,
+        };
+        assert_eq!(decode.batch_size(), 2);
+        assert_eq!(decode.avg_context_length(), 11);
+    }
+
+    #[test]
+    fn aic_model_derives_legacy_aggregates_from_exact_lengths() {
+        let callback = Arc::new(RecordingAicCallback::default());
+        let model = PerfModel::from_aic_callback(callback.clone());
+
+        model.prefill_latency_ms(ReplayPrefillInput::new(&[8, 13], &[4, 5]).unwrap());
+        model.decode_latency_ms(ReplayDecodeInput {
+            sequence_lengths: &[9, 14],
+            active_kv_tokens: 23,
+            total_kv_tokens: 128,
+            output_length: 2,
+        });
+
+        assert_eq!(*callback.prefill_calls.lock().unwrap(), vec![(2, 6, 4)]);
+        assert_eq!(*callback.decode_calls.lock().unwrap(), vec![(2, 11, 2)]);
     }
 }

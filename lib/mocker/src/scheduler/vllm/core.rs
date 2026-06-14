@@ -837,9 +837,6 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 .len()
                 .saturating_add(self.state.waiting.len().min(16)),
         );
-        let mut batch_count = 0usize;
-        let mut batch_total_isl = 0usize;
-        let mut batch_total_prefix = 0usize;
         let mut admissions = Vec::with_capacity(self.state.waiting.len().min(16));
         let mut preempted_any = false;
 
@@ -852,9 +849,6 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 None,
                 &mut token_budget,
                 &mut scheduled,
-                &mut batch_count,
-                &mut batch_total_isl,
-                &mut batch_total_prefix,
                 &mut preempted_any,
             ) {
                 ScheduleOutcome::Scheduled { admission, .. } => {
@@ -936,9 +930,6 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 Some(&prefill_cost),
                 &mut token_budget,
                 &mut scheduled,
-                &mut batch_count,
-                &mut batch_total_isl,
-                &mut batch_total_prefix,
                 &mut preempted_any,
             ) {
                 ScheduleOutcome::Scheduled {
@@ -966,10 +957,19 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
             }
         }
 
+        // The running queue preserves forward-pass order; entries removed from
+        // `scheduled` by preemption are omitted from the model input.
+        let (prefill_sequence_lengths, prefill_prefix_lengths): (Vec<_>, Vec<_>) = self
+            .state
+            .running
+            .iter()
+            .filter_map(|uuid| scheduled.get(uuid))
+            .filter(|work| work.prompt_tokens > 0)
+            .map(|work| (work.prefix_tokens + work.prompt_tokens, work.prefix_tokens))
+            .unzip();
         let prefill_time = predict_prefill_duration(
-            batch_count,
-            batch_total_isl,
-            batch_total_prefix,
+            &prefill_sequence_lengths,
+            &prefill_prefix_lengths,
             &self.args,
             self.latency_model.as_ref(),
         );
@@ -1105,9 +1105,6 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
         prefill_cost: Option<&PrefillCost>,
         token_budget: &mut usize,
         scheduled: &mut FxHashMap<Uuid, ScheduledWork>,
-        batch_count: &mut usize,
-        batch_total_isl: &mut usize,
-        batch_total_prefix: &mut usize,
         preempted_any: &mut bool,
     ) -> ScheduleOutcome {
         let request = self
@@ -1214,12 +1211,6 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
             *preempted_any = true;
             if let Some(undone) = scheduled.remove(&preempted.uuid) {
                 *token_budget += undone.total_tokens;
-                if undone.prompt_tokens > 0 && self.args.worker_type != WorkerType::Decode {
-                    *batch_count = batch_count.saturating_sub(1);
-                    *batch_total_isl =
-                        batch_total_isl.saturating_sub(undone.prefix_tokens + undone.prompt_tokens);
-                    *batch_total_prefix = batch_total_prefix.saturating_sub(undone.prefix_tokens);
-                }
             }
             if preempted.uuid == uuid {
                 return ScheduleOutcome::CurrentPreempted;
@@ -1252,11 +1243,6 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 sequence_len,
             },
         );
-        if prompt_tokens > 0 && self.args.worker_type != WorkerType::Decode {
-            *batch_count += 1;
-            *batch_total_isl += prompt_before + prompt_tokens;
-            *batch_total_prefix += prompt_before;
-        }
 
         if from_waiting {
             self.state.transition_to_running(uuid);
@@ -1284,7 +1270,7 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
         decode_start_ms: f64,
     ) -> (Duration, Vec<OutputSignal>) {
         let mut ready = Vec::with_capacity(self.state.running.len());
-        let mut total_length = 0usize;
+        let mut sequence_lengths = Vec::with_capacity(self.state.running.len());
         for uuid in self.state.running.iter().copied() {
             let Some(request) = self.state.requests.get(&uuid) else {
                 continue;
@@ -1295,7 +1281,7 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 continue;
             }
             ready.push(uuid);
-            total_length += request.sequence.len();
+            sequence_lengths.push(request.sequence.len());
         }
         if ready.is_empty() {
             return (Duration::ZERO, Vec::new());
@@ -1312,12 +1298,10 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
         } else {
             let active_kv_tokens = self.kv_manager.num_active_blocks() * self.args.block_size;
             let total_kv_tokens = self.args.num_gpu_blocks * self.args.block_size;
-            let context_length = total_length / ready.len();
             let decode_ms = normalize_replay_latency_ms(
                 self.latency_model.decode_latency_ms(ReplayDecodeInput {
-                    batch_size: ready.len(),
+                    sequence_lengths: &sequence_lengths,
                     active_kv_tokens,
-                    context_length,
                     total_kv_tokens,
                     output_length: 2,
                 }),
@@ -1468,11 +1452,11 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
             }
         };
 
-        let total_length = ready
+        let sequence_lengths = ready
             .iter()
             .filter_map(|uuid| self.state.requests.get(uuid))
             .map(|request| request.sequence.len())
-            .sum::<usize>();
+            .collect::<Vec<_>>();
         let (decode_time, decode_end_ms) = if self.args.worker_type == WorkerType::Prefill {
             (Duration::ZERO, decode_start_ms)
         } else {
@@ -1482,12 +1466,10 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 .saturating_sub(reservation.len())
                 * self.args.block_size;
             let total_kv_tokens = self.args.num_gpu_blocks * self.args.block_size;
-            let context_length = total_length / ready.len();
             let decode_ms = normalize_replay_latency_ms(
                 self.latency_model.decode_latency_ms(ReplayDecodeInput {
-                    batch_size: ready.len(),
+                    sequence_lengths: &sequence_lengths,
                     active_kv_tokens,
-                    context_length,
                     total_kv_tokens,
                     output_length: 2,
                 }),
@@ -1608,24 +1590,20 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
 }
 
 fn predict_prefill_duration<M: ReplayLatencyModel>(
-    batch_count: usize,
-    batch_total_isl: usize,
-    batch_total_prefix: usize,
+    sequence_lengths: &[usize],
+    prefix_lengths: &[usize],
     args: &MockEngineArgs,
     latency_model: &M,
 ) -> Duration {
-    if batch_count == 0 || args.worker_type == WorkerType::Decode {
+    if sequence_lengths.is_empty() || args.worker_type == WorkerType::Decode {
         return Duration::ZERO;
     }
 
-    let mean_isl = batch_total_isl / batch_count;
-    let mean_prefix = batch_total_prefix / batch_count;
     let prefill_ms = normalize_replay_latency_ms(
-        latency_model.prefill_latency_ms(ReplayPrefillInput {
-            batch_size: batch_count,
-            input_sequence_length: mean_isl,
-            prefix_length: mean_prefix,
-        }),
+        latency_model.prefill_latency_ms(
+            ReplayPrefillInput::new(sequence_lengths, prefix_lengths)
+                .expect("vLLM prefill batch must contain valid request shapes"),
+        ),
         0.0,
         "prefill",
     );

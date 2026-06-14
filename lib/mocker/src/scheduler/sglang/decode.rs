@@ -196,17 +196,18 @@ pub(super) fn simulate_decode_step_with_sampler<M: ReplayLatencyModel>(
         };
     }
 
-    let total_context: usize = running
+    let sequence_lengths = running
         .iter()
         .map(SglangRequest::current_sequence_len)
-        .sum();
-    let avg_context = total_context / running.len();
-    let active_kv_tokens = total_context.min(config.total_kv_tokens);
+        .collect::<Vec<_>>();
+    let active_kv_tokens = sequence_lengths
+        .iter()
+        .sum::<usize>()
+        .min(config.total_kv_tokens);
     let decode_time = normalize_replay_latency_ms(
         latency_model.decode_latency_ms(ReplayDecodeInput {
-            batch_size: running.len(),
+            sequence_lengths: &sequence_lengths,
             active_kv_tokens,
-            context_length: avg_context,
             total_kv_tokens: config.total_kv_tokens,
             output_length: 2,
         }),
