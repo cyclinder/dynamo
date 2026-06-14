@@ -30,7 +30,7 @@ const MAX_CONSECUTIVE_NO_PROGRESS_PASSES: usize = 1024;
 pub(super) struct SingleRuntime<M: ReplayLatencyModel = PerfModel> {
     current_time_ms: f64,
     admission: AdmissionSource,
-    worker: ReplayWorkerCore<M>,
+    worker: ReplayWorkerCore<M, M>,
     collector: TraceCollector,
     mode: SingleReplayMode,
     progress: ReplayProgress,
@@ -42,6 +42,7 @@ pub(super) struct SingleRuntime<M: ReplayLatencyModel = PerfModel> {
 }
 
 impl SingleRuntime<PerfModel> {
+    #[cfg(test)]
     pub(super) fn new(
         args: MockEngineArgs,
         pending: VecDeque<DirectRequest>,
@@ -98,7 +99,11 @@ impl<M: ReplayLatencyModel> SingleRuntime<M> {
         Self {
             current_time_ms: 0.0,
             admission,
-            worker: ReplayWorkerCore::new_with_latency_model(args, latency_model),
+            worker: ReplayWorkerCore::new_with_latency_models(
+                args,
+                Arc::clone(&latency_model),
+                latency_model,
+            ),
             collector: TraceCollector::default(),
             mode,
             progress: ReplayProgress::new(total_requests, "offline replay"),

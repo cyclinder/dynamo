@@ -13,7 +13,10 @@ mod validate;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-pub use crate::common::perf_model::{ReplayDecodeInput, ReplayLatencyModel, ReplayPrefillInput};
+pub use crate::common::perf_model::{
+    ReplayDecodeInput, ReplayDecodeLatencyModel, ReplayLatencyModel, ReplayPrefillInput,
+    ReplayPrefillLatencyModel,
+};
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use dynamo_kv_router::PrefillLoadEstimator;
 
@@ -106,6 +109,88 @@ impl<M: ReplayLatencyModel> Replay<M> {
             num_workers,
             router_mode,
         )
+    }
+}
+
+/// Offline disaggregated replay runner with independent stage latency models.
+#[derive(Clone)]
+pub struct DisaggregatedReplay<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> {
+    prefill_latency_model: Arc<P>,
+    decode_latency_model: Arc<D>,
+}
+
+impl<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> DisaggregatedReplay<P, D> {
+    pub fn new(prefill_latency_model: P, decode_latency_model: D) -> Self {
+        Self::from_arcs(
+            Arc::new(prefill_latency_model),
+            Arc::new(decode_latency_model),
+        )
+    }
+
+    pub fn from_arcs(prefill_latency_model: Arc<P>, decode_latency_model: Arc<D>) -> Self {
+        Self {
+            prefill_latency_model,
+            decode_latency_model,
+        }
+    }
+
+    pub fn prefill_latency_model(&self) -> &P {
+        self.prefill_latency_model.as_ref()
+    }
+
+    pub fn decode_latency_model(&self) -> &D {
+        self.decode_latency_model.as_ref()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn simulate_trace_requests(
+        &self,
+        config: OfflineDisaggReplayConfig,
+        router_config: Option<dynamo_kv_router::config::KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        requests: Vec<DirectRequest>,
+        arrival_speedup_ratio: f64,
+        router_mode: ReplayRouterMode,
+    ) -> anyhow::Result<TraceSimulationReport> {
+        entrypoints::simulate_trace_requests_disagg_with_latency_models(
+            Arc::clone(&self.prefill_latency_model),
+            Arc::clone(&self.decode_latency_model),
+            config,
+            router_config,
+            prefill_load_estimator,
+            requests,
+            arrival_speedup_ratio,
+            router_mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn simulate_concurrency_requests(
+        &self,
+        config: OfflineDisaggReplayConfig,
+        router_config: Option<dynamo_kv_router::config::KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        requests: Vec<DirectRequest>,
+        max_in_flight: usize,
+        router_mode: ReplayRouterMode,
+    ) -> anyhow::Result<TraceSimulationReport> {
+        entrypoints::simulate_concurrency_requests_disagg_with_latency_models(
+            Arc::clone(&self.prefill_latency_model),
+            Arc::clone(&self.decode_latency_model),
+            config,
+            router_config,
+            prefill_load_estimator,
+            requests,
+            max_in_flight,
+            router_mode,
+        )
+    }
+}
+
+impl<M: ReplayLatencyModel> DisaggregatedReplay<M, M> {
+    pub fn shared(latency_model: M) -> Self {
+        let latency_model = Arc::new(latency_model);
+        Self::from_arcs(Arc::clone(&latency_model), latency_model)
     }
 }
 
@@ -223,7 +308,7 @@ mod tests {
         decode_inputs: Arc<Mutex<Vec<RecordedDecodeInput>>>,
     }
 
-    impl ReplayLatencyModel for RecordingLatencyModel {
+    impl ReplayPrefillLatencyModel for RecordingLatencyModel {
         fn prefill_latency_ms(&self, input: ReplayPrefillInput<'_>) -> f64 {
             self.prefill_inputs
                 .lock()
@@ -234,7 +319,9 @@ mod tests {
                 });
             2.0
         }
+    }
 
+    impl ReplayDecodeLatencyModel for RecordingLatencyModel {
         fn decode_latency_ms(&self, input: ReplayDecodeInput<'_>) -> f64 {
             self.decode_inputs
                 .lock()
@@ -307,7 +394,43 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|input| { input.sequence_lengths == [8, 12] && input.output_length == 2 })
+                    .any(|input| { input.sequence_lengths == [8, 12] && input.output_length == 1 })
+            );
+        }
+    }
+
+    #[test]
+    fn generic_replay_preserves_speculative_decode_width() {
+        for engine_type in [
+            crate::common::protocols::EngineType::Vllm,
+            crate::common::protocols::EngineType::Sglang,
+        ] {
+            let model = RecordingLatencyModel::default();
+            let replay = Replay::new(model.clone());
+            let mut args = replay_args(engine_type);
+            args.aic_nextn = Some(2);
+            args.aic_nextn_accept_rates = Some("1,1".to_string());
+
+            let report = replay
+                .simulate_trace_requests(
+                    args,
+                    None,
+                    None,
+                    vec![replay_request(1, vec![1; 8], 0.0)],
+                    1,
+                    1.0,
+                    ReplayRouterMode::RoundRobin,
+                )
+                .unwrap();
+
+            assert_eq!(report.request_counts.completed_requests, 1);
+            assert!(
+                model
+                    .decode_inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|input| input.output_length == 3)
             );
         }
     }
@@ -345,6 +468,92 @@ mod tests {
                     .any(|input| { input.sequence_lengths == [8] && input.prefix_lengths == [4] })
             );
         }
+    }
+
+    #[test]
+    fn free_function_and_native_replay_use_the_same_perf_model_path() {
+        let args = replay_args(crate::common::protocols::EngineType::Vllm);
+        let replay = Replay::from_arc(Arc::clone(&args.perf_model));
+        let requests = vec![
+            replay_request(1, vec![1; 8], 0.0),
+            replay_request(2, vec![2; 12], 0.0),
+        ];
+
+        let free_report = simulate_trace_requests_with_router_mode(
+            args.clone(),
+            None,
+            None,
+            requests.clone(),
+            1,
+            1.0,
+            ReplayRouterMode::RoundRobin,
+        )
+        .unwrap();
+        let native_report = replay
+            .simulate_trace_requests(
+                args,
+                None,
+                None,
+                requests,
+                1,
+                1.0,
+                ReplayRouterMode::RoundRobin,
+            )
+            .unwrap();
+
+        assert_eq!(
+            free_report.request_counts.completed_requests,
+            native_report.request_counts.completed_requests
+        );
+        assert_eq!(
+            free_report.request_counts.total_input_tokens,
+            native_report.request_counts.total_input_tokens
+        );
+        assert_eq!(
+            free_report.request_counts.total_output_tokens,
+            native_report.request_counts.total_output_tokens
+        );
+        assert_eq!(
+            free_report.latency.ttft.mean_ms,
+            native_report.latency.ttft.mean_ms
+        );
+        assert_eq!(
+            free_report.latency.e2e.mean_ms,
+            native_report.latency.e2e.mean_ms
+        );
+    }
+
+    #[test]
+    fn shared_disaggregated_replay_routes_both_phases_through_one_model() {
+        use crate::common::protocols::WorkerType;
+
+        let model = RecordingLatencyModel::default();
+        let replay = DisaggregatedReplay::shared(model.clone());
+        let mut prefill_args = replay_args(crate::common::protocols::EngineType::Vllm);
+        prefill_args.worker_type = WorkerType::Prefill;
+        let mut decode_args = replay_args(crate::common::protocols::EngineType::Vllm);
+        decode_args.worker_type = WorkerType::Decode;
+        let config = OfflineDisaggReplayConfig {
+            prefill_args,
+            decode_args,
+            num_prefill_workers: 1,
+            num_decode_workers: 1,
+        };
+
+        let report = replay
+            .simulate_trace_requests(
+                config,
+                None,
+                None,
+                vec![replay_request(1, vec![1; 8], 0.0)],
+                1.0,
+                ReplayRouterMode::RoundRobin,
+            )
+            .unwrap();
+
+        assert_eq!(report.request_counts.completed_requests, 1);
+        assert!(!model.prefill_inputs.lock().unwrap().is_empty());
+        assert!(!model.decode_inputs.lock().unwrap().is_empty());
     }
 
     #[test]

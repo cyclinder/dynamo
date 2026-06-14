@@ -6,7 +6,7 @@ use std::time::Duration;
 #[cfg(test)]
 use crate::common::perf_model::PerfModel;
 use crate::common::perf_model::{
-    ReplayDecodeInput, ReplayLatencyModel, normalize_replay_latency_ms,
+    ReplayDecodeInput, ReplayDecodeLatencyModel, normalize_replay_latency_ms,
 };
 use crate::common::protocols::OutputSignal;
 use crate::common::speculative::SpeculativeDecodeSampler;
@@ -164,7 +164,7 @@ pub(super) fn simulate_decode_step(
     )
 }
 
-pub(super) fn simulate_decode_step_with_sampler<M: ReplayLatencyModel>(
+pub(super) fn simulate_decode_step_with_sampler<M: ReplayDecodeLatencyModel>(
     running: &mut Vec<SglangRequest>,
     kv_manager: &mut SglangKvManager,
     config: &SglangConfig,
@@ -200,20 +200,24 @@ pub(super) fn simulate_decode_step_with_sampler<M: ReplayLatencyModel>(
         .iter()
         .map(SglangRequest::current_sequence_len)
         .collect::<Vec<_>>();
-    let active_kv_tokens = sequence_lengths
-        .iter()
-        .sum::<usize>()
-        .min(config.total_kv_tokens);
-    let decode_time = normalize_replay_latency_ms(
-        latency_model.decode_latency_ms(ReplayDecodeInput {
-            sequence_lengths: &sequence_lengths,
-            active_kv_tokens,
-            total_kv_tokens: config.total_kv_tokens,
-            output_length: 2,
-        }),
-        1.0,
-        "decode",
-    );
+    let decode_time = if config.worker_type == crate::common::protocols::WorkerType::Prefill {
+        0.0
+    } else {
+        let active_kv_tokens = sequence_lengths
+            .iter()
+            .sum::<usize>()
+            .min(config.total_kv_tokens);
+        normalize_replay_latency_ms(
+            latency_model.decode_latency_ms(ReplayDecodeInput {
+                sequence_lengths: &sequence_lengths,
+                active_kv_tokens,
+                total_kv_tokens: config.total_kv_tokens,
+                output_length: max_burst,
+            }),
+            1.0,
+            "decode",
+        )
+    };
     let unscaled_time = Duration::from_secs_f64(decode_time / 1000.0);
     let effective_ratio = config.speedup_ratio * config.decode_speedup_ratio;
     let total_time = if apply_speedup && effective_ratio > 0.0 && unscaled_time > Duration::ZERO {

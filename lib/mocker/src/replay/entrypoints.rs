@@ -17,7 +17,9 @@ use super::{
     OfflineDisaggReplayConfig, ReplayPrefillLoadEstimator, ReplayRouterMode, ReplayWorkerArtifacts,
     TraceSimulationReport,
 };
-use crate::common::perf_model::ReplayLatencyModel;
+use crate::common::perf_model::{
+    ReplayDecodeLatencyModel, ReplayLatencyModel, ReplayPrefillLatencyModel,
+};
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use crate::loadgen::{AgenticTrace, Trace, TraceFileFormat};
 
@@ -431,13 +433,9 @@ pub fn simulate_trace_requests_with_router_mode(
     arrival_speedup_ratio: f64,
     router_mode: ReplayRouterMode,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
-    validate_offline_replay_args(&args, num_workers, router_mode)?;
-    if requests.is_empty() {
-        bail!("trace replay requires at least one request");
-    }
-
-    let report = crate::replay::offline::simulate_trace(
+    let latency_model = Arc::clone(&args.perf_model);
+    simulate_trace_requests_with_latency_model(
+        latency_model,
         args,
         router_config,
         prefill_load_estimator,
@@ -445,10 +443,7 @@ pub fn simulate_trace_requests_with_router_mode(
         num_workers,
         arrival_speedup_ratio,
         router_mode,
-        false,
-        None,
-    )?;
-    Ok(report)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -490,14 +485,44 @@ pub fn simulate_trace_requests_disagg_with_router_mode(
     arrival_speedup_ratio: f64,
     router_mode: ReplayRouterMode,
 ) -> Result<TraceSimulationReport> {
+    let prefill_latency_model = Arc::clone(&config.prefill_args.perf_model);
+    let decode_latency_model = Arc::clone(&config.decode_args.perf_model);
+    simulate_trace_requests_disagg_with_latency_models(
+        prefill_latency_model,
+        decode_latency_model,
+        config,
+        router_config,
+        prefill_load_estimator,
+        requests,
+        arrival_speedup_ratio,
+        router_mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_trace_requests_disagg_with_latency_models<
+    P: ReplayPrefillLatencyModel,
+    D: ReplayDecodeLatencyModel,
+>(
+    prefill_latency_model: Arc<P>,
+    decode_latency_model: Arc<D>,
+    config: OfflineDisaggReplayConfig,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    arrival_speedup_ratio: f64,
+    router_mode: ReplayRouterMode,
+) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
     validate_offline_disagg_replay_args(&config, router_mode)?;
     if requests.is_empty() {
         bail!("trace replay requires at least one request");
     }
 
-    let report = crate::replay::offline::simulate_trace_disagg(
+    crate::replay::offline::simulate_trace_disagg_with_latency_models(
         config,
+        prefill_latency_model,
+        decode_latency_model,
         router_config,
         prefill_load_estimator,
         requests,
@@ -505,8 +530,7 @@ pub fn simulate_trace_requests_disagg_with_router_mode(
         router_mode,
         false,
         None,
-    )?;
-    Ok(report)
+    )
 }
 
 pub fn simulate_trace_live_requests(
@@ -877,13 +901,9 @@ pub fn simulate_concurrency_requests_with_router_mode(
     num_workers: usize,
     router_mode: ReplayRouterMode,
 ) -> Result<TraceSimulationReport> {
-    let args = args.normalized()?;
-    validate_offline_concurrency_args(&args, num_workers, max_in_flight, router_mode)?;
-    if requests.is_empty() {
-        bail!("concurrency replay requires at least one request");
-    }
-
-    crate::replay::offline::simulate_concurrency(
+    let latency_model = Arc::clone(&args.perf_model);
+    simulate_concurrency_requests_with_latency_model(
+        latency_model,
         args,
         router_config,
         prefill_load_estimator,
@@ -891,8 +911,6 @@ pub fn simulate_concurrency_requests_with_router_mode(
         max_in_flight,
         num_workers,
         router_mode,
-        false,
-        None,
     )
 }
 
@@ -935,14 +953,44 @@ pub fn simulate_concurrency_requests_disagg_with_router_mode(
     max_in_flight: usize,
     router_mode: ReplayRouterMode,
 ) -> Result<TraceSimulationReport> {
+    let prefill_latency_model = Arc::clone(&config.prefill_args.perf_model);
+    let decode_latency_model = Arc::clone(&config.decode_args.perf_model);
+    simulate_concurrency_requests_disagg_with_latency_models(
+        prefill_latency_model,
+        decode_latency_model,
+        config,
+        router_config,
+        prefill_load_estimator,
+        requests,
+        max_in_flight,
+        router_mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_concurrency_requests_disagg_with_latency_models<
+    P: ReplayPrefillLatencyModel,
+    D: ReplayDecodeLatencyModel,
+>(
+    prefill_latency_model: Arc<P>,
+    decode_latency_model: Arc<D>,
+    config: OfflineDisaggReplayConfig,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    max_in_flight: usize,
+    router_mode: ReplayRouterMode,
+) -> Result<TraceSimulationReport> {
     let config = config.normalized()?;
     validate_offline_disagg_concurrency_args(&config, max_in_flight, router_mode)?;
     if requests.is_empty() {
         bail!("concurrency replay requires at least one request");
     }
 
-    crate::replay::offline::simulate_concurrency_disagg(
+    crate::replay::offline::simulate_concurrency_disagg_with_latency_models(
         config,
+        prefill_latency_model,
+        decode_latency_model,
         router_config,
         prefill_load_estimator,
         requests,

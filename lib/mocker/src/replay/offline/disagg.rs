@@ -23,6 +23,7 @@ use super::runtime_utils::{
 #[cfg(test)]
 use super::state::DisaggRequestSnapshot;
 use super::state::{DisaggPhase, DisaggRequestState};
+use crate::common::perf_model::{PerfModel, ReplayDecodeLatencyModel, ReplayPrefillLatencyModel};
 use crate::common::protocols::{DirectRequest, ForwardPassSnapshot, MockEngineArgs, OutputSignal};
 use crate::loadgen::{ReplayRequestHashes, WorkloadDriver};
 use crate::replay::{
@@ -61,14 +62,17 @@ pub(super) struct DisaggRuntimeStats {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct DisaggRuntimeStats;
 
-pub(in crate::replay) struct DisaggRuntime {
+pub(in crate::replay) struct DisaggRuntime<
+    P: ReplayPrefillLatencyModel = PerfModel,
+    D: ReplayDecodeLatencyModel = PerfModel,
+> {
     now_ms: f64,
     next_prefill_worker_idx: usize,
     next_decode_worker_idx: usize,
     next_event_seq: u64,
     admission: AdmissionQueue,
-    prefill_engine: EngineComponent,
-    decode_engine: EngineComponent,
+    prefill_engine: EngineComponent<P, D>,
+    decode_engine: EngineComponent<P, D>,
     prefill_router: Option<OfflineReplayRouter>,
     decode_router: Option<OfflineReplayRouter>,
     requests: HashMap<Uuid, DisaggRequestState>,
@@ -87,8 +91,8 @@ pub(in crate::replay) struct DisaggRuntime {
     max_sim_time_ms: Option<f64>,
 }
 
-impl DisaggRuntime {
-    /// Create a disaggregated offline runtime seeded from an explicit request queue.
+impl DisaggRuntime<PerfModel, PerfModel> {
+    #[cfg(test)]
     pub(in crate::replay) fn new(
         config: &OfflineDisaggReplayConfig,
         router_config: Option<KvRouterConfig>,
@@ -97,11 +101,14 @@ impl DisaggRuntime {
         mode: ReplayMode,
         router_mode: ReplayRouterMode,
     ) -> Result<Self> {
-        Self::new_with_source(
+        Self::new_with_latency_models(
             config,
+            Arc::clone(&config.prefill_args.perf_model),
+            Arc::clone(&config.decode_args.perf_model),
             router_config,
             prefill_load_estimator,
-            AdmissionQueue::new_requests(pending, mode),
+            pending,
+            mode,
             router_mode,
         )
     }
@@ -115,8 +122,57 @@ impl DisaggRuntime {
         mode: ReplayMode,
         router_mode: ReplayRouterMode,
     ) -> Result<Self> {
+        Self::new_workload_with_latency_models(
+            config,
+            Arc::clone(&config.prefill_args.perf_model),
+            Arc::clone(&config.decode_args.perf_model),
+            router_config,
+            prefill_load_estimator,
+            driver,
+            mode,
+            router_mode,
+        )
+    }
+}
+
+impl<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> DisaggRuntime<P, D> {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::replay) fn new_with_latency_models(
+        config: &OfflineDisaggReplayConfig,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
+        router_config: Option<KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        pending: VecDeque<DirectRequest>,
+        mode: ReplayMode,
+        router_mode: ReplayRouterMode,
+    ) -> Result<Self> {
         Self::new_with_source(
             config,
+            prefill_latency_model,
+            decode_latency_model,
+            router_config,
+            prefill_load_estimator,
+            AdmissionQueue::new_requests(pending, mode),
+            router_mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::replay) fn new_workload_with_latency_models(
+        config: &OfflineDisaggReplayConfig,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
+        router_config: Option<KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        driver: WorkloadDriver,
+        mode: ReplayMode,
+        router_mode: ReplayRouterMode,
+    ) -> Result<Self> {
+        Self::new_with_source(
+            config,
+            prefill_latency_model,
+            decode_latency_model,
             router_config,
             prefill_load_estimator,
             AdmissionQueue::new_workload(driver, mode),
@@ -124,9 +180,11 @@ impl DisaggRuntime {
         )
     }
 
-    /// Shared constructor for both raw-request and workload-driven admissions.
+    #[allow(clippy::too_many_arguments)]
     fn new_with_source(
         config: &OfflineDisaggReplayConfig,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
         router_config: Option<KvRouterConfig>,
         prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
         admission: AdmissionQueue,
@@ -158,43 +216,23 @@ impl DisaggRuntime {
         };
 
         let prefill_capture_kv = prefill_router.is_some();
-        let mut prefill_engine = EngineComponent::new(
+        let prefill_engine = EngineComponent::new(
             SimulationWorkerStage::Prefill,
             EnginePassMode::Hidden,
-            (0..config.num_prefill_workers)
-                .map(|worker_idx| {
-                    super::state::OfflineWorkerState::new(
-                        worker_idx,
-                        config.prefill_args.clone(),
-                        prefill_capture_kv,
-                    )
-                })
-                .collect(),
-            Arc::clone(&config.prefill_args.perf_model),
-        );
-        prefill_engine.set_scaling_args(
             config.prefill_args.clone(),
             prefill_capture_kv,
-            Arc::clone(&config.prefill_args.perf_model),
+            Arc::clone(&prefill_latency_model),
+            Arc::clone(&decode_latency_model),
+            config.num_prefill_workers,
         );
-        let mut decode_engine = EngineComponent::new(
+        let decode_engine = EngineComponent::new(
             SimulationWorkerStage::Decode,
             EnginePassMode::Visible,
-            (0..config.num_decode_workers)
-                .map(|worker_idx| {
-                    super::state::OfflineWorkerState::new(
-                        worker_idx,
-                        config.decode_args.clone(),
-                        false,
-                    )
-                })
-                .collect(),
-            Arc::clone(&config.decode_args.perf_model),
-        );
-        decode_engine.set_scaling_args(
             config.decode_args.clone(),
             false,
-            Arc::clone(&config.decode_args.perf_model),
+            prefill_latency_model,
+            decode_latency_model,
+            config.num_decode_workers,
         );
 
         Ok(Self {
@@ -1130,6 +1168,8 @@ fn derive_decode_router_config(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::entrypoints::{
         run_concurrency_collect, run_concurrency_workload_collect, run_trace_collect,
@@ -1138,6 +1178,30 @@ mod tests {
     use super::*;
     use crate::common::protocols::{EngineType, MockEngineArgs, SglangArgs, WorkerType};
     use crate::loadgen::{SessionTrace, Trace, TurnTrace};
+
+    #[derive(Default)]
+    struct PrefillOnlyLatencyModel {
+        calls: AtomicUsize,
+    }
+
+    impl ReplayPrefillLatencyModel for PrefillOnlyLatencyModel {
+        fn prefill_latency_ms(&self, _input: crate::replay::ReplayPrefillInput<'_>) -> f64 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            1.0
+        }
+    }
+
+    #[derive(Default)]
+    struct DecodeOnlyLatencyModel {
+        calls: AtomicUsize,
+    }
+
+    impl ReplayDecodeLatencyModel for DecodeOnlyLatencyModel {
+        fn decode_latency_ms(&self, _input: crate::replay::ReplayDecodeInput<'_>) -> f64 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            1.0
+        }
+    }
 
     fn staged_args(worker_type: WorkerType, speedup_ratio: f64) -> MockEngineArgs {
         MockEngineArgs::builder()
@@ -1434,6 +1498,49 @@ mod tests {
                 Some(stats.decode_assignments[&uuid])
             );
         }
+    }
+
+    #[test]
+    fn phase_specific_models_reach_workers_added_during_scaling() {
+        let config = scaling_test_disagg_config();
+        let prefill_model = Arc::new(PrefillOnlyLatencyModel::default());
+        let decode_model = Arc::new(DecodeOnlyLatencyModel::default());
+        let pending = VecDeque::from([
+            request(1, 128, 3, 0.0),
+            request(2, 128, 3, 0.0),
+            request(3, 128, 3, 0.0),
+            request(4, 128, 3, 0.0),
+        ]);
+        let mut runtime = DisaggRuntime::new_with_latency_models(
+            &config,
+            Arc::clone(&prefill_model),
+            Arc::clone(&decode_model),
+            None,
+            None,
+            pending,
+            ReplayMode::Concurrency { max_in_flight: 4 },
+            ReplayRouterMode::RoundRobin,
+        )
+        .unwrap();
+
+        runtime.apply_scaling(2, 2).unwrap();
+        let (collector, stats) = runtime.run().unwrap();
+        let report = collector.finish();
+
+        assert_eq!(report.request_counts.completed_requests, 4);
+        assert!(
+            stats
+                .prefill_assignments
+                .values()
+                .any(|worker| *worker == 1),
+            "the scaled prefill worker should receive work"
+        );
+        assert!(
+            stats.decode_assignments.values().any(|worker| *worker == 1),
+            "the scaled decode worker should receive work"
+        );
+        assert!(prefill_model.calls.load(Ordering::Relaxed) > 0);
+        assert!(decode_model.calls.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

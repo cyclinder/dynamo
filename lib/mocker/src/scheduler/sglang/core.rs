@@ -9,7 +9,8 @@ use dynamo_kv_router::protocols::WorkerId;
 use uuid::Uuid;
 
 use crate::common::perf_model::{
-    PerfModel, ReplayLatencyModel, ReplayPrefillInput, normalize_replay_latency_ms,
+    PerfModel, ReplayDecodeLatencyModel, ReplayPrefillInput, ReplayPrefillLatencyModel,
+    normalize_replay_latency_ms,
 };
 use crate::common::protocols::{DirectRequest, KvEventPublishers, MockEngineArgs, WorkerType};
 use crate::common::speculative::{SpeculativeDecodeSampler, normalize_conditional_accept_rates};
@@ -22,13 +23,17 @@ use super::policy::apply_schedule_policy;
 use super::prefill::get_new_batch_prefill;
 use super::request::SglangRequest;
 use crate::scheduler::{
-    CapturedRouterEventBuffer, EnginePassResult, MockerMetrics, RouterEventVisibility,
-    accept_length_sample, build_fpm_snapshot, capture_router_event_sink,
+    AdmissionEvent, CapturedRouterEventBuffer, EnginePassResult, MockerMetrics,
+    RouterEventVisibility, accept_length_sample, build_fpm_snapshot, capture_router_event_sink,
 };
 
-pub(crate) struct SglangCore<M: ReplayLatencyModel = PerfModel> {
+pub(crate) struct SglangCore<
+    P: ReplayPrefillLatencyModel = PerfModel,
+    D: ReplayDecodeLatencyModel = PerfModel,
+> {
     pub(super) config: SglangConfig,
-    latency_model: Arc<M>,
+    prefill_latency_model: Arc<P>,
+    decode_latency_model: Arc<D>,
     dp_rank: u32,
     pub(super) waiting: VecDeque<SglangRequest>,
     pub(super) running: Vec<SglangRequest>,
@@ -39,15 +44,20 @@ pub(crate) struct SglangCore<M: ReplayLatencyModel = PerfModel> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-impl SglangCore<PerfModel> {
+impl SglangCore<PerfModel, PerfModel> {
     pub(crate) fn new(args: MockEngineArgs) -> Self {
         let latency_model = Arc::clone(&args.perf_model);
-        Self::new_with_latency_model(args, latency_model)
+        Self::new_with_latency_models(args, Arc::clone(&latency_model), latency_model)
     }
 
     pub(crate) fn new_with_kv_capture(args: MockEngineArgs, worker_id: WorkerId) -> Self {
         let latency_model = Arc::clone(&args.perf_model);
-        Self::new_with_kv_capture_and_latency_model(args, worker_id, latency_model)
+        Self::new_with_kv_capture_and_latency_models(
+            args,
+            worker_id,
+            Arc::clone(&latency_model),
+            latency_model,
+        )
     }
 
     pub(super) fn new_with_sink(
@@ -56,15 +66,26 @@ impl SglangCore<PerfModel> {
         kv_event_publishers: KvEventPublishers,
     ) -> Self {
         let latency_model = Arc::clone(&args.perf_model);
-        Self::new_with_sink_and_latency_model(args, dp_rank, kv_event_publishers, latency_model)
+        Self::new_with_sink_and_latency_models(
+            args,
+            dp_rank,
+            kv_event_publishers,
+            Arc::clone(&latency_model),
+            latency_model,
+        )
     }
 }
 
-impl<M: ReplayLatencyModel> SglangCore<M> {
-    pub(crate) fn new_with_latency_model(args: MockEngineArgs, latency_model: Arc<M>) -> Self {
+impl<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> SglangCore<P, D> {
+    pub(crate) fn new_with_latency_models(
+        args: MockEngineArgs,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
+    ) -> Self {
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             0,
             0,
             None,
@@ -72,14 +93,16 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
         )
     }
 
-    pub(crate) fn new_with_worker_id_and_latency_model(
+    pub(crate) fn new_with_worker_id_and_latency_models(
         args: MockEngineArgs,
         worker_id: WorkerId,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
     ) -> Self {
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             0,
             worker_id,
             None,
@@ -87,15 +110,17 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
         )
     }
 
-    pub(crate) fn new_with_kv_capture_and_latency_model(
+    pub(crate) fn new_with_kv_capture_and_latency_models(
         args: MockEngineArgs,
         worker_id: WorkerId,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
     ) -> Self {
         let (buffer, sink) = capture_router_event_sink(worker_id);
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             0,
             worker_id,
             Some(buffer),
@@ -103,15 +128,17 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
         )
     }
 
-    pub(super) fn new_with_sink_and_latency_model(
+    pub(super) fn new_with_sink_and_latency_models(
         args: MockEngineArgs,
         dp_rank: u32,
         kv_event_publishers: KvEventPublishers,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
     ) -> Self {
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             dp_rank,
             u64::from(dp_rank),
             None,
@@ -121,7 +148,8 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
 
     fn new_internal(
         args: MockEngineArgs,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
         dp_rank: u32,
         worker_id: WorkerId,
         kv_event_buffer: Option<CapturedRouterEventBuffer>,
@@ -139,7 +167,8 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
 
         Self {
             config,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             dp_rank,
             waiting: VecDeque::new(),
             running: Vec::new(),
@@ -202,38 +231,53 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
             self.new_token_ratio = self.config.init_new_token_ratio;
         }
 
-        for admission in &admit.admissions {
+        let scheduled_prefills = admit.scheduled_prefills;
+        for scheduled in &scheduled_prefills {
             if let Some(collector) = collector.as_deref_mut() {
-                collector.on_admit(admission.uuid, now_ms, admission.reused_input_tokens);
+                collector.on_admit(scheduled.request.uuid, now_ms, scheduled.prefix_tokens);
             }
         }
 
-        // Capture per-request prefill FPM data before dispersing can_run.
-        let prefill_fpm = admit.prefill_fpm;
-
-        let prefill_sequence_lengths = admit
-            .can_run
+        let prefill_sequence_lengths = scheduled_prefills
             .iter()
-            .map(|request| request.materialized_tokens)
+            .map(|scheduled| scheduled.request.materialized_tokens)
             .collect::<Vec<_>>();
-        let prefill_prefix_lengths = prefill_fpm
+        let prefill_prefix_lengths = scheduled_prefills
             .iter()
-            .map(|item| item.prefix_tokens)
+            .map(|scheduled| scheduled.prefix_tokens)
             .collect::<Vec<_>>();
         let prefill_time = simulate_prefill_duration(
             &prefill_sequence_lengths,
             &prefill_prefix_lengths,
             &self.config,
-            self.latency_model.as_ref(),
+            self.prefill_latency_model.as_ref(),
             true,
         );
 
-        for mut req in admit.can_run {
-            if req.materialized_tokens < req.current_sequence_len() {
-                cache_materialized_prefix(&mut req, &mut self.kv_manager, &self.config);
-                self.waiting.push_front(req);
+        let prefill_fpm = scheduled_prefills
+            .iter()
+            .map(|scheduled| {
+                (
+                    scheduled.prompt_len as u64,
+                    scheduled.prefix_tokens as u64,
+                    scheduled.tokens_computed as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let admissions = scheduled_prefills
+            .iter()
+            .map(|scheduled| AdmissionEvent {
+                uuid: scheduled.request.uuid,
+                reused_input_tokens: scheduled.prefix_tokens,
+            })
+            .collect();
+        for scheduled in scheduled_prefills {
+            let mut request = scheduled.request;
+            if request.materialized_tokens < request.current_sequence_len() {
+                cache_materialized_prefix(&mut request, &mut self.kv_manager, &self.config);
+                self.waiting.push_front(request);
             } else {
-                self.running.push(req);
+                self.running.push(request);
             }
         }
 
@@ -249,7 +293,7 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
             &mut self.running,
             &mut self.kv_manager,
             &self.config,
-            self.latency_model.as_ref(),
+            self.decode_latency_model.as_ref(),
             self.speculative_sampler.as_mut(),
             decode_start_ms,
             true,
@@ -274,20 +318,14 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
         // Build FPM snapshot now that all state has settled.
         let sglang_cache_hit_tokens = prefill_fpm
             .iter()
-            .map(|item| item.prefix_tokens as u64)
+            .map(|(_, prefix_tokens, _)| *prefix_tokens)
             .sum::<u64>();
         let sglang_cache_total_tokens = prefill_fpm
             .iter()
-            .map(|item| (item.prefix_tokens + item.tokens_computed) as u64)
+            .map(|(_, prefix_tokens, tokens_computed)| prefix_tokens + tokens_computed)
             .sum::<u64>();
         let fpm = build_fpm_snapshot(
-            prefill_fpm.iter().map(|p| {
-                (
-                    p.prompt_len as u64,
-                    p.prefix_tokens as u64,
-                    p.tokens_computed as u64,
-                )
-            }),
+            prefill_fpm.iter().copied(),
             scheduled_decode_lens.into_iter(),
             self.waiting
                 .iter()
@@ -312,7 +350,7 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
                 .filter(|signal| signal.completed)
                 .count(),
             output_signals: decode.output_signals,
-            admissions: admit.admissions,
+            admissions,
             mocker_metrics: MockerMetrics::from_parts(
                 self.dp_rank,
                 active_decode_blocks,
@@ -352,7 +390,7 @@ impl<M: ReplayLatencyModel> SglangCore<M> {
     }
 }
 
-fn simulate_prefill_duration<M: ReplayLatencyModel>(
+fn simulate_prefill_duration<M: ReplayPrefillLatencyModel>(
     sequence_lengths: &[usize],
     prefix_lengths: &[usize],
     config: &SglangConfig,

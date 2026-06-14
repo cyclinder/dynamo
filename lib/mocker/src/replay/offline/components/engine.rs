@@ -12,18 +12,21 @@ use super::super::runtime_utils::WorkerCompletionPayload;
 use super::super::state::OfflineWorkerSnapshot;
 use super::super::state::OfflineWorkerState;
 use super::{EngineEffects, EnginePassMode, ScheduledWorkerCompletion};
-use crate::common::perf_model::{PerfModel, ReplayLatencyModel};
+use crate::common::perf_model::{PerfModel, ReplayDecodeLatencyModel, ReplayPrefillLatencyModel};
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use crate::replay::TraceCollector;
 use crate::scheduler::RouterEventVisibility;
 #[cfg(feature = "kvbm-offload")]
 use dynamo_kv_router::protocols::RouterEvent;
 
-pub(in crate::replay::offline) struct EngineComponent<M: ReplayLatencyModel = PerfModel> {
+pub(in crate::replay::offline) struct EngineComponent<
+    P: ReplayPrefillLatencyModel = PerfModel,
+    D: ReplayDecodeLatencyModel = PerfModel,
+> {
     stage: SimulationWorkerStage,
     pass_mode: EnginePassMode,
     /// Workers keyed by stable ID (monotonic, never reused).
-    workers: BTreeMap<usize, OfflineWorkerState<M>>,
+    workers: BTreeMap<usize, OfflineWorkerState<P, D>>,
     /// Counter for generating the next stable worker ID.
     next_id: usize,
     /// Workers marked for removal — skipped by round-robin, removed when drained.
@@ -34,52 +37,57 @@ pub(in crate::replay::offline) struct EngineComponent<M: ReplayLatencyModel = Pe
     args: MockEngineArgs,
     /// Whether new workers should capture KV events (true when a router is present).
     capture_kv_events: bool,
-    latency_model: Arc<M>,
+    prefill_latency_model: Arc<P>,
+    decode_latency_model: Arc<D>,
 }
 
-impl<M: ReplayLatencyModel> EngineComponent<M> {
+impl<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> EngineComponent<P, D> {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::replay::offline) fn new(
         stage: SimulationWorkerStage,
         pass_mode: EnginePassMode,
-        workers: Vec<OfflineWorkerState<M>>,
-        latency_model: Arc<M>,
+        args: MockEngineArgs,
+        capture_kv_events: bool,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
+        num_workers: usize,
     ) -> Self {
-        let count = workers.len();
-        let map: BTreeMap<usize, OfflineWorkerState<M>> = workers.into_iter().enumerate().collect();
+        let workers = (0..num_workers)
+            .map(|worker_idx| {
+                OfflineWorkerState::new_with_latency_models(
+                    worker_idx,
+                    args.clone(),
+                    capture_kv_events,
+                    Arc::clone(&prefill_latency_model),
+                    Arc::clone(&decode_latency_model),
+                )
+            })
+            .enumerate()
+            .collect();
         Self {
             stage,
             pass_mode,
-            workers: map,
-            next_id: count,
+            workers,
+            next_id: num_workers,
             pending_removal: BTreeSet::new(),
             pending_startup: BTreeSet::new(),
-            args: MockEngineArgs::default(),
-            capture_kv_events: false,
-            latency_model,
+            args,
+            capture_kv_events,
+            prefill_latency_model,
+            decode_latency_model,
         }
-    }
-
-    /// Set the engine args and KV capture flag used when adding workers dynamically.
-    pub(in crate::replay::offline) fn set_scaling_args(
-        &mut self,
-        args: MockEngineArgs,
-        capture_kv_events: bool,
-        latency_model: Arc<M>,
-    ) {
-        self.args = args;
-        self.capture_kv_events = capture_kv_events;
-        self.latency_model = latency_model;
     }
 
     /// Add a new worker, returning its stable ID.
     pub(in crate::replay::offline) fn add_worker(&mut self) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        let worker = OfflineWorkerState::new_with_latency_model(
+        let worker = OfflineWorkerState::new_with_latency_models(
             id,
             self.args.clone(),
             self.capture_kv_events,
-            Arc::clone(&self.latency_model),
+            Arc::clone(&self.prefill_latency_model),
+            Arc::clone(&self.decode_latency_model),
         );
         self.workers.insert(id, worker);
         id
@@ -360,18 +368,16 @@ mod tests {
             startup_time,
             ..MockEngineArgs::default()
         };
-        let workers: Vec<_> = (0..num_workers)
-            .map(|i| OfflineWorkerState::new(i, args.clone(), false))
-            .collect();
         let latency_model = Arc::clone(&args.perf_model);
-        let mut engine = EngineComponent::new(
+        EngineComponent::new(
             SimulationWorkerStage::Aggregated,
             EnginePassMode::Visible,
-            workers,
+            args,
+            false,
             Arc::clone(&latency_model),
-        );
-        engine.set_scaling_args(args, false, latency_model);
-        engine
+            latency_model,
+            num_workers,
+        )
     }
 
     #[test]

@@ -68,7 +68,7 @@ pub(in crate::replay) struct AggRuntime<M: ReplayLatencyModel = PerfModel> {
     next_event_seq: u64,
     admission: AdmissionQueue,
     requests: FxHashMap<Uuid, AggRequestState>,
-    engine: EngineComponent<M>,
+    engine: EngineComponent<M, M>,
     collector: TraceCollector,
     events: BinaryHeap<SimulationEvent>,
     router: Option<OfflineReplayRouter>,
@@ -89,6 +89,7 @@ pub(in crate::replay) struct AggRuntime<M: ReplayLatencyModel = PerfModel> {
 }
 
 impl AggRuntime<PerfModel> {
+    #[cfg(test)]
     pub(in crate::replay) fn new(
         args: &MockEngineArgs,
         router_config: Option<KvRouterConfig>,
@@ -201,22 +202,15 @@ impl<M: ReplayLatencyModel> AggRuntime<M> {
             )?),
         };
         let capture_kv_events = router.is_some();
-        let mut engine = EngineComponent::new(
+        let engine = EngineComponent::new(
             SimulationWorkerStage::Aggregated,
             EnginePassMode::Visible,
-            (0..num_workers)
-                .map(|worker_idx| {
-                    super::state::OfflineWorkerState::new_with_latency_model(
-                        worker_idx,
-                        args.clone(),
-                        capture_kv_events,
-                        Arc::clone(&latency_model),
-                    )
-                })
-                .collect(),
+            args,
+            capture_kv_events,
             Arc::clone(&latency_model),
+            latency_model,
+            num_workers,
         );
-        engine.set_scaling_args(args, capture_kv_events, latency_model);
 
         Ok(Self {
             now_ms: 0.0,

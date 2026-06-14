@@ -3,24 +3,21 @@
 
 use std::collections::VecDeque;
 
-use super::super::AdmissionEvent;
 use super::config::{SglangConfig, ceil_to_block};
 use super::request::SglangRequest;
 use crate::kv_manager::SglangKvManager;
 
-/// Per-request prefill data needed for FPM snapshot construction.
-pub(super) struct PrefillFpmItem {
+/// One request selected for the current SGLang prefill forward pass.
+pub(super) struct ScheduledPrefill {
+    pub(super) request: SglangRequest,
     pub(super) prompt_len: usize,
     pub(super) tokens_computed: usize,
     pub(super) prefix_tokens: usize,
 }
 
 pub(super) struct AdmitResult {
-    pub(super) can_run: Vec<SglangRequest>,
-    pub(super) admissions: Vec<AdmissionEvent>,
+    pub(super) scheduled_prefills: Vec<ScheduledPrefill>,
     pub(super) oom: bool,
-    /// Per-request prefill info for building FPM snapshots.
-    pub(super) prefill_fpm: Vec<PrefillFpmItem>,
 }
 
 pub(super) fn get_new_batch_prefill(
@@ -55,9 +52,7 @@ pub(super) fn get_new_batch_prefill(
     let mut rem_input_tokens = config.max_prefill_tokens as f64;
     let mut rem_chunk_tokens = config.chunked_prefill_size as f64;
 
-    let mut can_run = Vec::new();
-    let mut admissions = Vec::new();
-    let mut prefill_fpm = Vec::new();
+    let mut scheduled_prefills = Vec::new();
     let mut rejected = VecDeque::new();
     let mut oom = false;
 
@@ -143,20 +138,16 @@ pub(super) fn get_new_batch_prefill(
                 .min(config.clip_max_new_tokens)
         };
 
-        admissions.push(AdmissionEvent {
-            uuid: req.uuid,
-            reused_input_tokens: alloc.prefix_len,
-        });
-        prefill_fpm.push(PrefillFpmItem {
-            prompt_len: req.prompt_len(),
-            tokens_computed: chunk_tokens,
-            prefix_tokens: alloc.prefix_len,
-        });
-
+        let prompt_len = req.prompt_len();
         rem_total_tokens -= (req.allocated_tokens - old_allocated_tokens + output_reserve) as f64;
         rem_input_tokens -= charged_input_tokens;
         rem_chunk_tokens -= charged_input_tokens;
-        can_run.push(req);
+        scheduled_prefills.push(ScheduledPrefill {
+            request: req,
+            prompt_len,
+            tokens_computed: chunk_tokens,
+            prefix_tokens: alloc.prefix_len,
+        });
 
         if rem_chunk_tokens <= 0.0 {
             break;
@@ -168,9 +159,7 @@ pub(super) fn get_new_batch_prefill(
     }
 
     AdmitResult {
-        can_run,
-        admissions,
+        scheduled_prefills,
         oom,
-        prefill_fpm,
     }
 }

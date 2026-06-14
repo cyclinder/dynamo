@@ -74,9 +74,7 @@ pub struct ReplayDecodeInput<'a> {
     pub sequence_lengths: &'a [usize],
     pub active_kv_tokens: usize,
     pub total_kv_tokens: usize,
-    /// Sequence length passed to models that predict generation latency from
-    /// an input/output pair. Replay requests one newly generated token by
-    /// querying an output length of two.
+    /// Maximum number of output tokens evaluated per request in this forward pass.
     pub output_length: usize,
 }
 
@@ -97,14 +95,23 @@ fn average_length(lengths: &[usize]) -> usize {
     lengths.iter().sum::<usize>() / lengths.len()
 }
 
-/// Latency model used by replay schedulers.
+/// Prefill latency model used by replay schedulers.
+pub trait ReplayPrefillLatencyModel: Send + Sync {
+    fn prefill_latency_ms(&self, input: ReplayPrefillInput<'_>) -> f64;
+}
+
+/// Decode latency model used by replay schedulers.
+pub trait ReplayDecodeLatencyModel: Send + Sync {
+    fn decode_latency_ms(&self, input: ReplayDecodeInput<'_>) -> f64;
+}
+
+/// Combined latency model used by aggregated replay schedulers.
 ///
 /// Implementations may call a local model, cross an FFI boundary, or use any
 /// other transport. Returned values are milliseconds.
-pub trait ReplayLatencyModel: Send + Sync {
-    fn prefill_latency_ms(&self, input: ReplayPrefillInput<'_>) -> f64;
-    fn decode_latency_ms(&self, input: ReplayDecodeInput<'_>) -> f64;
-}
+pub trait ReplayLatencyModel: ReplayPrefillLatencyModel + ReplayDecodeLatencyModel {}
+
+impl<T> ReplayLatencyModel for T where T: ReplayPrefillLatencyModel + ReplayDecodeLatencyModel {}
 
 pub(crate) fn normalize_replay_latency_ms(
     latency_ms: f64,
@@ -405,7 +412,7 @@ impl PerfModel {
     }
 }
 
-impl ReplayLatencyModel for PerfModel {
+impl ReplayPrefillLatencyModel for PerfModel {
     fn prefill_latency_ms(&self, input: ReplayPrefillInput<'_>) -> f64 {
         self.predict_prefill_aggregates(
             input.batch_size(),
@@ -413,14 +420,16 @@ impl ReplayLatencyModel for PerfModel {
             input.avg_prefix_length(),
         )
     }
+}
 
+impl ReplayDecodeLatencyModel for PerfModel {
     fn decode_latency_ms(&self, input: ReplayDecodeInput<'_>) -> f64 {
         self.predict_decode_aggregates(
             input.batch_size(),
             input.active_kv_tokens,
             input.avg_context_length(),
             input.total_kv_tokens,
-            input.output_length,
+            2,
         )
     }
 }
@@ -473,10 +482,11 @@ mod tests {
             sequence_lengths: &[9, 14],
             active_kv_tokens: 23,
             total_kv_tokens: 128,
-            output_length: 2,
+            output_length: 3,
         };
         assert_eq!(decode.batch_size(), 2);
         assert_eq!(decode.avg_context_length(), 11);
+        assert_eq!(decode.output_length, 3);
     }
 
     #[test]
@@ -489,7 +499,7 @@ mod tests {
             sequence_lengths: &[9, 14],
             active_kv_tokens: 23,
             total_kv_tokens: 128,
-            output_length: 2,
+            output_length: 3,
         });
 
         assert_eq!(*callback.prefill_calls.lock().unwrap(), vec![(2, 6, 4)]);

@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::common::perf_model::{
-    PerfModel, ReplayDecodeInput, ReplayLatencyModel, ReplayPrefillInput,
-    normalize_replay_latency_ms,
+    PerfModel, ReplayDecodeInput, ReplayDecodeLatencyModel, ReplayPrefillInput,
+    ReplayPrefillLatencyModel, normalize_replay_latency_ms,
 };
 #[cfg(feature = "kvbm-offload")]
 use crate::common::protocols::G1;
@@ -357,9 +357,13 @@ enum SwapInAdmissionAttempt {
     BlockedOnG1Offload,
 }
 
-pub(crate) struct VllmCore<M: ReplayLatencyModel = PerfModel> {
+pub(crate) struct VllmCore<
+    P: ReplayPrefillLatencyModel = PerfModel,
+    D: ReplayDecodeLatencyModel = PerfModel,
+> {
     pub(super) args: MockEngineArgs,
-    latency_model: Arc<M>,
+    prefill_latency_model: Arc<P>,
+    decode_latency_model: Arc<D>,
     dp_rank: u32,
     pub(super) state: SchedulerState,
     pub(super) kv_manager: KvManager,
@@ -379,15 +383,20 @@ pub(crate) struct VllmCore<M: ReplayLatencyModel = PerfModel> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-impl VllmCore<PerfModel> {
+impl VllmCore<PerfModel, PerfModel> {
     pub(crate) fn new(args: MockEngineArgs) -> Self {
         let latency_model = Arc::clone(&args.perf_model);
-        Self::new_with_latency_model(args, latency_model)
+        Self::new_with_latency_models(args, Arc::clone(&latency_model), latency_model)
     }
 
     pub(crate) fn new_with_kv_capture(args: MockEngineArgs, worker_id: WorkerId) -> Self {
         let latency_model = Arc::clone(&args.perf_model);
-        Self::new_with_kv_capture_and_latency_model(args, worker_id, latency_model)
+        Self::new_with_kv_capture_and_latency_models(
+            args,
+            worker_id,
+            Arc::clone(&latency_model),
+            latency_model,
+        )
     }
 
     pub(super) fn new_with_sink(
@@ -396,15 +405,26 @@ impl VllmCore<PerfModel> {
         kv_event_publishers: KvEventPublishers,
     ) -> Self {
         let latency_model = Arc::clone(&args.perf_model);
-        Self::new_with_sink_and_latency_model(args, dp_rank, kv_event_publishers, latency_model)
+        Self::new_with_sink_and_latency_models(
+            args,
+            dp_rank,
+            kv_event_publishers,
+            Arc::clone(&latency_model),
+            latency_model,
+        )
     }
 }
 
-impl<M: ReplayLatencyModel> VllmCore<M> {
-    pub(crate) fn new_with_latency_model(args: MockEngineArgs, latency_model: Arc<M>) -> Self {
+impl<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> VllmCore<P, D> {
+    pub(crate) fn new_with_latency_models(
+        args: MockEngineArgs,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
+    ) -> Self {
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             0,
             0,
             None,
@@ -412,14 +432,16 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
         )
     }
 
-    pub(crate) fn new_with_worker_id_and_latency_model(
+    pub(crate) fn new_with_worker_id_and_latency_models(
         args: MockEngineArgs,
         worker_id: WorkerId,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
     ) -> Self {
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             0,
             worker_id,
             None,
@@ -427,15 +449,17 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
         )
     }
 
-    pub(crate) fn new_with_kv_capture_and_latency_model(
+    pub(crate) fn new_with_kv_capture_and_latency_models(
         args: MockEngineArgs,
         worker_id: WorkerId,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
     ) -> Self {
         let (buffer, sink) = capture_router_event_sink(worker_id);
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             0,
             worker_id,
             Some(buffer),
@@ -443,15 +467,17 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
         )
     }
 
-    pub(super) fn new_with_sink_and_latency_model(
+    pub(super) fn new_with_sink_and_latency_models(
         args: MockEngineArgs,
         dp_rank: u32,
         kv_event_publishers: KvEventPublishers,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
     ) -> Self {
         Self::new_internal(
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             dp_rank,
             u64::from(dp_rank),
             None,
@@ -461,7 +487,8 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
 
     fn new_internal(
         args: MockEngineArgs,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
         dp_rank: u32,
         worker_id: WorkerId,
         kv_event_buffer: Option<CapturedRouterEventBuffer>,
@@ -487,7 +514,8 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 dp_rank,
             ),
             args,
-            latency_model,
+            prefill_latency_model,
+            decode_latency_model,
             dp_rank,
             state: SchedulerState::default(),
             speculative_sampler,
@@ -971,7 +999,7 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
             &prefill_sequence_lengths,
             &prefill_prefix_lengths,
             &self.args,
-            self.latency_model.as_ref(),
+            self.prefill_latency_model.as_ref(),
         );
         let decode_start_ms = now_ms + prefill_time.as_secs_f64() * 1000.0;
         let (decode_time, mut output_signals) = self.emit_ready_tokens(collector, decode_start_ms);
@@ -1299,12 +1327,13 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
             let active_kv_tokens = self.kv_manager.num_active_blocks() * self.args.block_size;
             let total_kv_tokens = self.args.num_gpu_blocks * self.args.block_size;
             let decode_ms = normalize_replay_latency_ms(
-                self.latency_model.decode_latency_ms(ReplayDecodeInput {
-                    sequence_lengths: &sequence_lengths,
-                    active_kv_tokens,
-                    total_kv_tokens,
-                    output_length: 2,
-                }),
+                self.decode_latency_model
+                    .decode_latency_ms(ReplayDecodeInput {
+                        sequence_lengths: &sequence_lengths,
+                        active_kv_tokens,
+                        total_kv_tokens,
+                        output_length: 1,
+                    }),
                 1.0,
                 "decode",
             );
@@ -1467,12 +1496,13 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
                 * self.args.block_size;
             let total_kv_tokens = self.args.num_gpu_blocks * self.args.block_size;
             let decode_ms = normalize_replay_latency_ms(
-                self.latency_model.decode_latency_ms(ReplayDecodeInput {
-                    sequence_lengths: &sequence_lengths,
-                    active_kv_tokens,
-                    total_kv_tokens,
-                    output_length: 2,
-                }),
+                self.decode_latency_model
+                    .decode_latency_ms(ReplayDecodeInput {
+                        sequence_lengths: &sequence_lengths,
+                        active_kv_tokens,
+                        total_kv_tokens,
+                        output_length: max_burst,
+                    }),
                 1.0,
                 "decode",
             );
@@ -1589,7 +1619,7 @@ impl<M: ReplayLatencyModel> VllmCore<M> {
     }
 }
 
-fn predict_prefill_duration<M: ReplayLatencyModel>(
+fn predict_prefill_duration<M: ReplayPrefillLatencyModel>(
     sequence_lengths: &[usize],
     prefix_lengths: &[usize],
     args: &MockEngineArgs,

@@ -8,7 +8,7 @@ mod kv_event_sink;
 pub mod sglang;
 pub mod vllm;
 
-use crate::common::perf_model::{PerfModel, ReplayLatencyModel};
+use crate::common::perf_model::{PerfModel, ReplayDecodeLatencyModel, ReplayPrefillLatencyModel};
 pub use crate::common::protocols::ForwardPassSnapshot;
 use crate::common::protocols::{DirectRequest, FpmPublisher, KvEventPublishers, OutputSignal};
 use dynamo_kv_router::protocols::RouterEvent;
@@ -171,12 +171,15 @@ pub(crate) enum RouterEventVisibility {
 }
 
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum EngineCore<M: ReplayLatencyModel = PerfModel> {
-    Vllm(VllmCore<M>),
-    Sglang(SglangCore<M>),
+pub(crate) enum EngineCore<
+    P: ReplayPrefillLatencyModel = PerfModel,
+    D: ReplayDecodeLatencyModel = PerfModel,
+> {
+    Vllm(VllmCore<P, D>),
+    Sglang(SglangCore<P, D>),
 }
 
-impl<M: ReplayLatencyModel> EngineCore<M> {
+impl<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> EngineCore<P, D> {
     pub(crate) fn receive(&mut self, request: DirectRequest) -> Uuid {
         match self {
             Self::Vllm(core) => core.receive(request),

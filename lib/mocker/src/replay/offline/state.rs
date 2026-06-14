@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::common::perf_model::{PerfModel, ReplayLatencyModel};
+use crate::common::perf_model::{PerfModel, ReplayDecodeLatencyModel, ReplayPrefillLatencyModel};
 use crate::common::protocols::DirectRequest;
 use crate::common::protocols::MockEngineArgs;
 use crate::replay::TraceCollector;
@@ -147,8 +147,11 @@ impl DisaggRequestState {
     }
 }
 
-pub(crate) struct OfflineWorkerState<M: ReplayLatencyModel = PerfModel> {
-    core: EngineCore<M>,
+pub(crate) struct OfflineWorkerState<
+    P: ReplayPrefillLatencyModel = PerfModel,
+    D: ReplayDecodeLatencyModel = PerfModel,
+> {
+    core: EngineCore<P, D>,
     busy: bool,
     in_flight: usize,
 }
@@ -162,35 +165,31 @@ pub(crate) struct OfflineWorkerSnapshot {
     pub(crate) drained: bool,
 }
 
-impl OfflineWorkerState<PerfModel> {
-    pub(crate) fn new(worker_idx: usize, args: MockEngineArgs, capture_kv_events: bool) -> Self {
-        let latency_model = Arc::clone(&args.perf_model);
-        Self::new_with_latency_model(worker_idx, args, capture_kv_events, latency_model)
-    }
-}
-
-impl<M: ReplayLatencyModel> OfflineWorkerState<M> {
-    pub(crate) fn new_with_latency_model(
+impl<P: ReplayPrefillLatencyModel, D: ReplayDecodeLatencyModel> OfflineWorkerState<P, D> {
+    pub(crate) fn new_with_latency_models(
         worker_idx: usize,
         args: MockEngineArgs,
         capture_kv_events: bool,
-        latency_model: Arc<M>,
+        prefill_latency_model: Arc<P>,
+        decode_latency_model: Arc<D>,
     ) -> Self {
         let core = match args.engine_type {
             crate::common::protocols::EngineType::Vllm
             | crate::common::protocols::EngineType::Trtllm => {
                 #[cfg_attr(not(feature = "kvbm-offload"), allow(unused_mut))]
                 let mut core = if capture_kv_events {
-                    crate::scheduler::VllmCore::new_with_kv_capture_and_latency_model(
+                    crate::scheduler::VllmCore::new_with_kv_capture_and_latency_models(
                         args,
                         worker_idx as u64,
-                        latency_model,
+                        prefill_latency_model,
+                        decode_latency_model,
                     )
                 } else {
-                    crate::scheduler::VllmCore::new_with_worker_id_and_latency_model(
+                    crate::scheduler::VllmCore::new_with_worker_id_and_latency_models(
                         args,
                         worker_idx as u64,
-                        latency_model,
+                        prefill_latency_model,
+                        decode_latency_model,
                     )
                 };
                 #[cfg(feature = "kvbm-offload")]
@@ -204,18 +203,20 @@ impl<M: ReplayLatencyModel> OfflineWorkerState<M> {
             crate::common::protocols::EngineType::Sglang => {
                 if capture_kv_events {
                     EngineCore::Sglang(
-                        crate::scheduler::SglangCore::new_with_kv_capture_and_latency_model(
+                        crate::scheduler::SglangCore::new_with_kv_capture_and_latency_models(
                             args,
                             worker_idx as u64,
-                            latency_model,
+                            prefill_latency_model,
+                            decode_latency_model,
                         ),
                     )
                 } else {
                     EngineCore::Sglang(
-                        crate::scheduler::SglangCore::new_with_worker_id_and_latency_model(
+                        crate::scheduler::SglangCore::new_with_worker_id_and_latency_models(
                             args,
                             worker_idx as u64,
-                            latency_model,
+                            prefill_latency_model,
+                            decode_latency_model,
                         ),
                     )
                 }
