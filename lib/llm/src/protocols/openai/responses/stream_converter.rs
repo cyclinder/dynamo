@@ -621,16 +621,7 @@ impl ResponseStreamConverter {
     /// `self.params` rather than hardcoded at each emit site.
     fn make_sse_event(&self, event: &ResponseStreamEvent) -> Result<Event, anyhow::Error> {
         let event_type = get_event_type(event);
-        let mut data = self.serialize_event_data(event)?;
-        if let Some(nvext) = &self.nvext {
-            let mut value: Value = serde_json::from_str(&data)?;
-            if let Value::Object(ref mut obj) = value
-                && let Some(Value::Object(inner)) = obj.get_mut("response")
-            {
-                inner.insert("nvext".to_string(), nvext.clone());
-            }
-            data = serde_json::to_string(&value)?;
-        }
+        let data = self.serialize_event_data(event)?;
         Ok(Event::default().event(event_type).data(data))
     }
 
@@ -651,6 +642,7 @@ impl ResponseStreamConverter {
                     event.sequence_number,
                     &event.response,
                     spec,
+                    self.nvext.as_ref(),
                 ))
             }
             ResponseStreamEvent::ResponseInProgress(event) => {
@@ -659,6 +651,7 @@ impl ResponseStreamConverter {
                     event.sequence_number,
                     &event.response,
                     spec,
+                    self.nvext.as_ref(),
                 ))
             }
             ResponseStreamEvent::ResponseCompleted(event) => {
@@ -667,6 +660,7 @@ impl ResponseStreamConverter {
                     event.sequence_number,
                     &event.response,
                     spec,
+                    self.nvext.as_ref(),
                 ))
             }
             ResponseStreamEvent::ResponseFailed(event) => {
@@ -675,6 +669,7 @@ impl ResponseStreamConverter {
                     event.sequence_number,
                     &event.response,
                     spec,
+                    self.nvext.as_ref(),
                 ))
             }
             ResponseStreamEvent::ResponseIncomplete(event) => {
@@ -683,6 +678,7 @@ impl ResponseStreamConverter {
                     event.sequence_number,
                     &event.response,
                     spec,
+                    self.nvext.as_ref(),
                 ))
             }
             ResponseStreamEvent::ResponseQueued(event) => {
@@ -691,6 +687,7 @@ impl ResponseStreamConverter {
                     event.sequence_number,
                     &event.response,
                     spec,
+                    self.nvext.as_ref(),
                 ))
             }
             _ => serde_json::to_string(event),
@@ -710,6 +707,7 @@ struct ResponseEventForSpec<'a> {
     sequence_number: u64,
     response: &'a Response,
     spec: ResponseSpecFields,
+    nvext: Option<&'a Value>,
 }
 
 impl<'a> ResponseEventForSpec<'a> {
@@ -718,12 +716,14 @@ impl<'a> ResponseEventForSpec<'a> {
         sequence_number: u64,
         response: &'a Response,
         spec: ResponseSpecFields,
+        nvext: Option<&'a Value>,
     ) -> Self {
         Self {
             event_type,
             sequence_number,
             response,
             spec,
+            nvext,
         }
     }
 }
@@ -738,6 +738,7 @@ impl Serialize for ResponseEventForSpec<'_> {
             &ResponseForSpec {
                 response: self.response,
                 spec: self.spec,
+                nvext: self.nvext,
             },
         )?;
         map.end()
@@ -747,6 +748,7 @@ impl Serialize for ResponseEventForSpec<'_> {
 struct ResponseForSpec<'a> {
     response: &'a Response,
     spec: ResponseSpecFields,
+    nvext: Option<&'a Value>,
 }
 
 // Mirrors async-openai's `Response` serialization while writing Dynamo's
@@ -795,6 +797,9 @@ impl Serialize for ResponseForSpec<'_> {
         map.serialize_entry("presence_penalty", &self.spec.presence_penalty)?;
         map.serialize_entry("frequency_penalty", &self.spec.frequency_penalty)?;
         map.serialize_entry("store", &self.spec.store)?;
+        if let Some(nvext) = self.nvext {
+            map.serialize_entry("nvext", nvext)?;
+        }
 
         map.end()
     }

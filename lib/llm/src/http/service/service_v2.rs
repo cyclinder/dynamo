@@ -134,7 +134,7 @@ impl State {
         manager: Arc<ModelManager>,
         discovery_client: Arc<dyn Discovery>,
         cancel_token: CancellationToken,
-    ) -> anyhow::Result<Self> {
+    ) -> Self {
         Self::new_with_nvext_enabled(manager, discovery_client, cancel_token, true)
     }
 
@@ -143,17 +143,17 @@ impl State {
         discovery_client: Arc<dyn Discovery>,
         cancel_token: CancellationToken,
         nvext_enabled: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> Self {
         let responses_context_store = Arc::new(
-            ResponseContextStoreManager::from_env_with_shutdown(cancel_token.child_token())?,
+            ResponseContextStoreManager::from_env_with_shutdown(cancel_token.child_token()),
         );
-        Ok(Self::new_with_responses_context_store(
+        Self::new_with_responses_context_store(
             manager,
             discovery_client,
             cancel_token,
             nvext_enabled,
             responses_context_store,
-        ))
+        )
     }
 
     pub fn new_with_responses_context_store(
@@ -647,7 +647,7 @@ impl HttpServiceConfigBuilder {
             Some(store) => store,
             None => Arc::new(ResponseContextStoreManager::from_env_with_shutdown(
                 cancel_token.child_token(),
-            )?),
+            )),
         };
         let state = Arc::new(State::new_with_responses_context_store(
             model_manager,
@@ -962,6 +962,38 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn responses_store_configuration_is_validated_during_warmup() {
+        temp_env::async_with_vars(
+            [(
+                "DYN_STATEFUL_RESPONSES_STORE_URL",
+                Some("unsupported://store"),
+            )],
+            async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("failed to bind ephemeral port");
+                let service = HttpService::builder()
+                    .port(listener.local_addr().unwrap().port())
+                    .build()
+                    .expect("store configuration should be lazy");
+
+                let err = service
+                    .run_with_listener(CancellationToken::new(), listener)
+                    .await
+                    .expect_err("unsupported store should fail during warmup");
+                let error = format!("{err:#}");
+                assert!(
+                    error.contains("failed to initialize stateful Responses store"),
+                    "{error}"
+                );
+                assert!(error.contains("unsupported key-value store URL"), "{error}");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn custom_responses_store_bypasses_url_initialization() {
         temp_env::async_with_vars(
             [(
@@ -1127,5 +1159,4 @@ mod tests {
             );
         });
     }
-
 }
