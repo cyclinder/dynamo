@@ -16,8 +16,9 @@ pub(crate) mod state;
 
 pub(crate) use entrypoints::{
     generate_trace_worker_artifacts, simulate_agentic_trace_workload, simulate_concurrency,
-    simulate_concurrency_disagg, simulate_concurrency_workload,
-    simulate_concurrency_workload_accumulating_deltas, simulate_concurrency_workload_disagg,
-    simulate_trace, simulate_trace_disagg, simulate_trace_workload,
+    simulate_concurrency_disagg, simulate_concurrency_with_latency_model,
+    simulate_concurrency_workload, simulate_concurrency_workload_accumulating_deltas,
+    simulate_concurrency_workload_disagg, simulate_trace, simulate_trace_disagg,
+    simulate_trace_with_latency_model, simulate_trace_workload,
     simulate_trace_workload_accumulating_deltas, simulate_trace_workload_disagg,
 };

@@ -15,6 +15,61 @@ use ndarray_interp::interp2d::{Bilinear, Interp2DBuilder};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Inputs for one replay prefill latency prediction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayPrefillInput {
+    pub batch_size: usize,
+    pub input_sequence_length: usize,
+    pub prefix_length: usize,
+}
+
+impl ReplayPrefillInput {
+    pub fn effective_input_sequence_length(self) -> usize {
+        self.input_sequence_length
+            .saturating_sub(self.prefix_length)
+    }
+}
+
+/// Inputs for one replay decode latency prediction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayDecodeInput {
+    pub batch_size: usize,
+    pub active_kv_tokens: usize,
+    pub context_length: usize,
+    pub total_kv_tokens: usize,
+    /// Sequence length passed to models that predict generation latency from
+    /// an input/output pair. Replay requests one newly generated token by
+    /// querying an output length of two.
+    pub output_length: usize,
+}
+
+/// Latency model used by replay schedulers.
+///
+/// Implementations may call a local model, cross an FFI boundary, or use any
+/// other transport. Returned values are milliseconds.
+pub trait ReplayLatencyModel: Send + Sync {
+    fn prefill_latency_ms(&self, input: ReplayPrefillInput) -> f64;
+    fn decode_latency_ms(&self, input: ReplayDecodeInput) -> f64;
+}
+
+pub(crate) fn normalize_replay_latency_ms(
+    latency_ms: f64,
+    minimum_ms: f64,
+    phase: &'static str,
+) -> f64 {
+    if latency_ms.is_finite() && latency_ms >= 0.0 {
+        return latency_ms.max(minimum_ms);
+    }
+
+    tracing::warn!(
+        phase,
+        latency_ms,
+        minimum_ms,
+        "Replay latency model returned an invalid latency; using the minimum"
+    );
+    minimum_ms
+}
+
 /// Trait to abstract over 1D interpolation for prefill timing
 pub trait PrefillInterpolator: Send + Sync {
     fn interp(&self, x: f64) -> Result<f64, InterpolateError>;
@@ -213,36 +268,15 @@ impl PerfModel {
     }
 
     /// Predict prefill time in milliseconds.
-    ///
-    /// Callers always pass all parameters; each variant uses what it needs:
-    /// - Polynomial/Interpolated: uses total new tokens across the batch
-    ///   (`batch_size * (isl - prefix)`), modeling GPU processing total tokens in parallel
-    /// - Aiconfigurator: passes (batch_size, isl - prefix, prefix) to the AIC SDK
     pub fn predict_prefill_time(&self, batch_size: usize, isl: usize, prefix: usize) -> f64 {
-        let new_tokens_per_req = isl.saturating_sub(prefix);
-        let time = match self {
-            PerfModel::Polynomial => {
-                // Total tokens across the batch — GPU processes them in parallel
-                let tokens = (batch_size * new_tokens_per_req) as f64;
-                4.209989e-07 * tokens.powi(2) + 1.518344e-02 * tokens + 1.650142e+01
-            }
-            PerfModel::Interpolated { prefill_interp, .. } => {
-                let tokens = (batch_size * new_tokens_per_req) as f64;
-                prefill_interp.interp(tokens).unwrap_or(0.0)
-            }
-            PerfModel::Aiconfigurator { callback } => {
-                callback.predict_prefill(batch_size, new_tokens_per_req, prefix)
-            }
-        };
-        time.max(0.0)
+        self.prefill_latency_ms(ReplayPrefillInput {
+            batch_size,
+            input_sequence_length: isl,
+            prefix_length: prefix,
+        })
     }
 
     /// Predict decode time in milliseconds.
-    ///
-    /// Callers always pass all parameters; each variant uses what it needs:
-    /// - Polynomial: uses (active_kv_tokens, total_kv_tokens) as utilization
-    /// - Interpolated: uses (active_kv_tokens, context_length)
-    /// - Aiconfigurator: uses (batch_size, context_length)
     pub fn predict_decode_time(
         &self,
         batch_size: usize,
@@ -250,13 +284,43 @@ impl PerfModel {
         context_length: usize,
         total_kv_tokens: usize,
     ) -> f64 {
-        if batch_size == 0 {
+        self.decode_latency_ms(ReplayDecodeInput {
+            batch_size,
+            active_kv_tokens,
+            context_length,
+            total_kv_tokens,
+            output_length: 2,
+        })
+    }
+}
+
+impl ReplayLatencyModel for PerfModel {
+    fn prefill_latency_ms(&self, input: ReplayPrefillInput) -> f64 {
+        let new_tokens_per_req = input.effective_input_sequence_length();
+        let time = match self {
+            PerfModel::Polynomial => {
+                let tokens = (input.batch_size * new_tokens_per_req) as f64;
+                4.209989e-07 * tokens.powi(2) + 1.518344e-02 * tokens + 1.650142e+01
+            }
+            PerfModel::Interpolated { prefill_interp, .. } => {
+                let tokens = (input.batch_size * new_tokens_per_req) as f64;
+                prefill_interp.interp(tokens).unwrap_or(0.0)
+            }
+            PerfModel::Aiconfigurator { callback } => {
+                callback.predict_prefill(input.batch_size, new_tokens_per_req, input.prefix_length)
+            }
+        };
+        time.max(0.0)
+    }
+
+    fn decode_latency_ms(&self, input: ReplayDecodeInput) -> f64 {
+        if input.batch_size == 0 {
             return 0.0;
         }
         let time = match self {
             PerfModel::Polynomial => {
-                let active_perc = if total_kv_tokens > 0 {
-                    active_kv_tokens as f64 / total_kv_tokens as f64
+                let active_perc = if input.total_kv_tokens > 0 {
+                    input.active_kv_tokens as f64 / input.total_kv_tokens as f64
                 } else {
                     tracing::warn!("Total KV tokens is 0, using 1.0 as capacity");
                     1.0
@@ -264,16 +328,19 @@ impl PerfModel {
                 -25.74 * active_perc.powi(2) + 54.01 * active_perc + 5.74
             }
             PerfModel::Interpolated { decode_interp, .. } => decode_interp
-                .interp(active_kv_tokens as f64, context_length as f64)
+                .interp(input.active_kv_tokens as f64, input.context_length as f64)
                 .unwrap_or(0.0),
             PerfModel::Aiconfigurator { callback } => {
-                callback.predict_decode(batch_size, context_length, 2)
+                callback.predict_decode(input.batch_size, input.context_length, input.output_length)
             }
         };
-        // Token-emitting decode steps should not collapse onto the same timestamp.
         let result = time.max(1.0);
         tracing::trace!(
-            "Decode time prediction: batch_size={batch_size}, active_kv_tokens={active_kv_tokens}, context_length={context_length}, time={result:.2}ms"
+            batch_size = input.batch_size,
+            active_kv_tokens = input.active_kv_tokens,
+            context_length = input.context_length,
+            time_ms = result,
+            "Decode time prediction"
         );
         result
     }

@@ -3,11 +3,13 @@
 
 use super::core::ReplayWorkerCore;
 use super::progress::ReplayProgress;
+use crate::common::perf_model::{PerfModel, ReplayLatencyModel};
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use crate::loadgen::WorkloadDriver;
 use crate::replay::TraceCollector;
 use anyhow::bail;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy)]
@@ -25,10 +27,10 @@ enum AdmissionSource {
 // output reservation ratio before an otherwise valid request can be admitted.
 const MAX_CONSECUTIVE_NO_PROGRESS_PASSES: usize = 1024;
 
-pub(super) struct SingleRuntime {
+pub(super) struct SingleRuntime<M: ReplayLatencyModel = PerfModel> {
     current_time_ms: f64,
     admission: AdmissionSource,
-    worker: ReplayWorkerCore,
+    worker: ReplayWorkerCore<M>,
     collector: TraceCollector,
     mode: SingleReplayMode,
     progress: ReplayProgress,
@@ -39,13 +41,14 @@ pub(super) struct SingleRuntime {
     max_sim_time_ms: Option<f64>,
 }
 
-impl SingleRuntime {
+impl SingleRuntime<PerfModel> {
     pub(super) fn new(
         args: MockEngineArgs,
         pending: VecDeque<DirectRequest>,
         mode: SingleReplayMode,
     ) -> Self {
-        Self::new_with_source(args, AdmissionSource::Requests(pending), mode)
+        let latency_model = Arc::clone(&args.perf_model);
+        Self::new_with_latency_model(args, latency_model, pending, mode)
     }
 
     pub(super) fn new_workload(
@@ -53,11 +56,38 @@ impl SingleRuntime {
         driver: WorkloadDriver,
         mode: SingleReplayMode,
     ) -> Self {
-        Self::new_with_source(args, AdmissionSource::Workload(driver), mode)
+        let latency_model = Arc::clone(&args.perf_model);
+        Self::new_workload_with_latency_model(args, latency_model, driver, mode)
+    }
+}
+
+impl<M: ReplayLatencyModel> SingleRuntime<M> {
+    pub(super) fn new_with_latency_model(
+        args: MockEngineArgs,
+        latency_model: Arc<M>,
+        pending: VecDeque<DirectRequest>,
+        mode: SingleReplayMode,
+    ) -> Self {
+        Self::new_with_source(
+            args,
+            latency_model,
+            AdmissionSource::Requests(pending),
+            mode,
+        )
+    }
+
+    pub(super) fn new_workload_with_latency_model(
+        args: MockEngineArgs,
+        latency_model: Arc<M>,
+        driver: WorkloadDriver,
+        mode: SingleReplayMode,
+    ) -> Self {
+        Self::new_with_source(args, latency_model, AdmissionSource::Workload(driver), mode)
     }
 
     fn new_with_source(
         args: MockEngineArgs,
+        latency_model: Arc<M>,
         admission: AdmissionSource,
         mode: SingleReplayMode,
     ) -> Self {
@@ -68,7 +98,7 @@ impl SingleRuntime {
         Self {
             current_time_ms: 0.0,
             admission,
-            worker: ReplayWorkerCore::new(args),
+            worker: ReplayWorkerCore::new_with_latency_model(args, latency_model),
             collector: TraceCollector::default(),
             mode,
             progress: ReplayProgress::new(total_requests, "offline replay"),

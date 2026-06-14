@@ -13,6 +13,7 @@ mod validate;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+pub use crate::common::perf_model::{ReplayDecodeInput, ReplayLatencyModel, ReplayPrefillInput};
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use dynamo_kv_router::PrefillLoadEstimator;
 
@@ -39,6 +40,74 @@ pub enum ReplayArgsMode {
 }
 
 pub type ReplayPrefillLoadEstimator = Arc<dyn PrefillLoadEstimator>;
+
+/// Generic offline replay runner for native latency model implementations.
+#[derive(Clone)]
+pub struct Replay<M: ReplayLatencyModel> {
+    latency_model: Arc<M>,
+}
+
+impl<M: ReplayLatencyModel> Replay<M> {
+    pub fn new(latency_model: M) -> Self {
+        Self {
+            latency_model: Arc::new(latency_model),
+        }
+    }
+
+    pub fn from_arc(latency_model: Arc<M>) -> Self {
+        Self { latency_model }
+    }
+
+    pub fn latency_model(&self) -> &M {
+        self.latency_model.as_ref()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn simulate_trace_requests(
+        &self,
+        args: MockEngineArgs,
+        router_config: Option<dynamo_kv_router::config::KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        requests: Vec<DirectRequest>,
+        num_workers: usize,
+        arrival_speedup_ratio: f64,
+        router_mode: ReplayRouterMode,
+    ) -> anyhow::Result<TraceSimulationReport> {
+        entrypoints::simulate_trace_requests_with_latency_model(
+            Arc::clone(&self.latency_model),
+            args,
+            router_config,
+            prefill_load_estimator,
+            requests,
+            num_workers,
+            arrival_speedup_ratio,
+            router_mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn simulate_concurrency_requests(
+        &self,
+        args: MockEngineArgs,
+        router_config: Option<dynamo_kv_router::config::KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        requests: Vec<DirectRequest>,
+        max_in_flight: usize,
+        num_workers: usize,
+        router_mode: ReplayRouterMode,
+    ) -> anyhow::Result<TraceSimulationReport> {
+        entrypoints::simulate_concurrency_requests_with_latency_model(
+            Arc::clone(&self.latency_model),
+            args,
+            router_config,
+            prefill_load_estimator,
+            requests,
+            max_in_flight,
+            num_workers,
+            router_mode,
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OfflineDisaggReplayConfig {
@@ -131,7 +200,82 @@ pub(crate) fn normalize_trace_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct RecordingLatencyModel {
+        prefill_inputs: Arc<Mutex<Vec<ReplayPrefillInput>>>,
+        decode_inputs: Arc<Mutex<Vec<ReplayDecodeInput>>>,
+    }
+
+    impl ReplayLatencyModel for RecordingLatencyModel {
+        fn prefill_latency_ms(&self, input: ReplayPrefillInput) -> f64 {
+            self.prefill_inputs.lock().unwrap().push(input);
+            2.0
+        }
+
+        fn decode_latency_ms(&self, input: ReplayDecodeInput) -> f64 {
+            self.decode_inputs.lock().unwrap().push(input);
+            1.0
+        }
+    }
+
+    #[test]
+    fn generic_replay_uses_native_latency_model() {
+        let model = RecordingLatencyModel::default();
+        let replay = Replay::new(model.clone());
+        let args = MockEngineArgs::builder()
+            .block_size(16)
+            .num_gpu_blocks(128)
+            .build()
+            .unwrap();
+        let requests = vec![
+            DirectRequest {
+                tokens: vec![1; 8],
+                max_output_tokens: 2,
+                uuid: Some(Uuid::from_u128(1)),
+                dp_rank: 0,
+                arrival_timestamp_ms: Some(0.0),
+                priority: 0,
+                strict_priority: 0,
+            },
+            DirectRequest {
+                tokens: vec![2; 12],
+                max_output_tokens: 2,
+                uuid: Some(Uuid::from_u128(2)),
+                dp_rank: 0,
+                arrival_timestamp_ms: Some(0.0),
+                priority: 0,
+                strict_priority: 0,
+            },
+        ];
+
+        let report = replay
+            .simulate_trace_requests(
+                args,
+                None,
+                None,
+                requests,
+                2,
+                1.0,
+                ReplayRouterMode::RoundRobin,
+            )
+            .unwrap();
+
+        assert_eq!(report.request_counts.completed_requests, 2);
+        let prefill_inputs = model.prefill_inputs.lock().unwrap();
+        assert!(!prefill_inputs.is_empty());
+        assert!(prefill_inputs.iter().all(|input| {
+            input.input_sequence_length >= input.prefix_length
+                && input.effective_input_sequence_length() > 0
+        }));
+        let decode_inputs = model.decode_inputs.lock().unwrap();
+        assert!(!decode_inputs.is_empty());
+        assert!(decode_inputs.iter().all(|input| {
+            input.batch_size > 0 && input.context_length > 0 && input.output_length == 2
+        }));
+    }
 
     #[test]
     fn test_replay_itl_uses_per_token_gaps() {

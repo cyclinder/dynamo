@@ -3,6 +3,11 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::common::perf_model::PerfModel;
+use crate::common::perf_model::{
+    ReplayDecodeInput, ReplayLatencyModel, normalize_replay_latency_ms,
+};
 use crate::common::protocols::OutputSignal;
 use crate::common::speculative::SpeculativeDecodeSampler;
 use crate::common::utils::compute_prefill_handoff_delay_ms;
@@ -147,20 +152,23 @@ pub(super) fn simulate_decode_step(
     current_time_ms: f64,
     apply_speedup: bool,
 ) -> DecodeResult {
+    let latency_model = PerfModel::default();
     simulate_decode_step_with_sampler(
         running,
         kv_manager,
         config,
+        &latency_model,
         None,
         current_time_ms,
         apply_speedup,
     )
 }
 
-pub(super) fn simulate_decode_step_with_sampler(
+pub(super) fn simulate_decode_step_with_sampler<M: ReplayLatencyModel>(
     running: &mut Vec<SglangRequest>,
     kv_manager: &mut SglangKvManager,
     config: &SglangConfig,
+    latency_model: &M,
     mut sampler: Option<&mut SpeculativeDecodeSampler>,
     current_time_ms: f64,
     apply_speedup: bool,
@@ -194,11 +202,16 @@ pub(super) fn simulate_decode_step_with_sampler(
         .sum();
     let avg_context = total_context / running.len();
     let active_kv_tokens = total_context.min(config.total_kv_tokens);
-    let decode_time = config.perf_model.predict_decode_time(
-        running.len(),
-        active_kv_tokens,
-        avg_context,
-        config.total_kv_tokens,
+    let decode_time = normalize_replay_latency_ms(
+        latency_model.decode_latency_ms(ReplayDecodeInput {
+            batch_size: running.len(),
+            active_kv_tokens,
+            context_length: avg_context,
+            total_kv_tokens: config.total_kv_tokens,
+            output_length: 2,
+        }),
+        1.0,
+        "decode",
     );
     let unscaled_time = Duration::from_secs_f64(decode_time / 1000.0);
     let effective_ratio = config.speedup_ratio * config.decode_speedup_ratio;

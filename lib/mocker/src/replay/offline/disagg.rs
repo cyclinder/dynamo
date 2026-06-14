@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use dynamo_kv_router::config::KvRouterConfig;
@@ -169,8 +170,13 @@ impl DisaggRuntime {
                     )
                 })
                 .collect(),
+            Arc::clone(&config.prefill_args.perf_model),
         );
-        prefill_engine.set_scaling_args(config.prefill_args.clone(), prefill_capture_kv);
+        prefill_engine.set_scaling_args(
+            config.prefill_args.clone(),
+            prefill_capture_kv,
+            Arc::clone(&config.prefill_args.perf_model),
+        );
         let mut decode_engine = EngineComponent::new(
             SimulationWorkerStage::Decode,
             EnginePassMode::Visible,
@@ -183,8 +189,13 @@ impl DisaggRuntime {
                     )
                 })
                 .collect(),
+            Arc::clone(&config.decode_args.perf_model),
         );
-        decode_engine.set_scaling_args(config.decode_args.clone(), false);
+        decode_engine.set_scaling_args(
+            config.decode_args.clone(),
+            false,
+            Arc::clone(&config.decode_args.perf_model),
+        );
 
         Ok(Self {
             now_ms: 0.0,

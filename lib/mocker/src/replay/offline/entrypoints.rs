@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -17,6 +18,7 @@ use super::disagg::DisaggRuntimeStats;
 use super::disagg::{DisaggRuntime, ReplayMode as DisaggReplayMode};
 use super::normalize_trace_requests;
 use super::single::{SingleReplayMode, SingleRuntime};
+use crate::common::perf_model::ReplayLatencyModel;
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use crate::loadgen::{AgenticTrace, Trace, WorkloadDriver};
 use crate::replay::OfflineDisaggReplayConfig;
@@ -119,6 +121,82 @@ pub(crate) fn generate_trace_worker_artifacts(
     }
 
     Ok(artifacts)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_trace_with_latency_model<M: ReplayLatencyModel>(
+    args: MockEngineArgs,
+    latency_model: Arc<M>,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    num_workers: usize,
+    arrival_speedup_ratio: f64,
+    router_mode: ReplayRouterMode,
+    record_per_request: bool,
+    max_sim_time_ms: Option<f64>,
+) -> Result<TraceSimulationReport> {
+    if use_single_runtime(num_workers, router_mode) {
+        simulate_trace_single_with_latency_model(
+            args,
+            latency_model,
+            requests,
+            arrival_speedup_ratio,
+            record_per_request,
+            max_sim_time_ms,
+        )
+    } else {
+        simulate_trace_multi_with_latency_model(
+            args,
+            latency_model,
+            router_config,
+            prefill_load_estimator,
+            requests,
+            num_workers,
+            arrival_speedup_ratio,
+            router_mode,
+            record_per_request,
+            max_sim_time_ms,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_concurrency_with_latency_model<M: ReplayLatencyModel>(
+    args: MockEngineArgs,
+    latency_model: Arc<M>,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    max_in_flight: usize,
+    num_workers: usize,
+    router_mode: ReplayRouterMode,
+    record_per_request: bool,
+    max_sim_time_ms: Option<f64>,
+) -> Result<TraceSimulationReport> {
+    if use_single_runtime(num_workers, router_mode) {
+        simulate_concurrency_single_with_latency_model(
+            args,
+            latency_model,
+            requests,
+            max_in_flight,
+            record_per_request,
+            max_sim_time_ms,
+        )
+    } else {
+        simulate_concurrency_multi_with_latency_model(
+            args,
+            latency_model,
+            router_config,
+            prefill_load_estimator,
+            requests,
+            max_in_flight,
+            num_workers,
+            router_mode,
+            record_per_request,
+            max_sim_time_ms,
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -485,6 +563,116 @@ pub(crate) fn simulate_concurrency_workload_disagg(
         prefill_load_estimator,
         driver,
         DisaggReplayMode::Concurrency { max_in_flight },
+        router_mode,
+    )?
+    .with_per_request_records(record_per_request)
+    .with_max_sim_time_ms(max_sim_time_ms)
+    .run()?;
+    Ok(finish_with_replay_wall_time(collector, started_at))
+}
+
+pub(crate) fn simulate_trace_single_with_latency_model<M: ReplayLatencyModel>(
+    args: MockEngineArgs,
+    latency_model: Arc<M>,
+    requests: Vec<DirectRequest>,
+    arrival_speedup_ratio: f64,
+    record_per_request: bool,
+    max_sim_time_ms: Option<f64>,
+) -> Result<TraceSimulationReport> {
+    let started_at = Instant::now();
+    let args = args.normalized()?;
+    let pending = normalize_trace_requests(requests, arrival_speedup_ratio)?;
+    let collector = SingleRuntime::new_with_latency_model(
+        args,
+        latency_model,
+        pending,
+        SingleReplayMode::Trace,
+    )
+    .with_per_request_records(record_per_request)
+    .with_max_sim_time_ms(max_sim_time_ms)
+    .run()?;
+    Ok(finish_with_replay_wall_time(collector, started_at))
+}
+
+pub(crate) fn simulate_concurrency_single_with_latency_model<M: ReplayLatencyModel>(
+    args: MockEngineArgs,
+    latency_model: Arc<M>,
+    requests: Vec<DirectRequest>,
+    max_in_flight: usize,
+    record_per_request: bool,
+    max_sim_time_ms: Option<f64>,
+) -> Result<TraceSimulationReport> {
+    let started_at = Instant::now();
+    let args = args.normalized()?;
+    let pending = VecDeque::from(requests);
+    let collector = SingleRuntime::new_with_latency_model(
+        args,
+        latency_model,
+        pending,
+        SingleReplayMode::Concurrency { max_in_flight },
+    )
+    .with_per_request_records(record_per_request)
+    .with_max_sim_time_ms(max_sim_time_ms)
+    .run()?;
+    Ok(finish_with_replay_wall_time(collector, started_at))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_trace_multi_with_latency_model<M: ReplayLatencyModel>(
+    args: MockEngineArgs,
+    latency_model: Arc<M>,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    num_workers: usize,
+    arrival_speedup_ratio: f64,
+    router_mode: ReplayRouterMode,
+    record_per_request: bool,
+    max_sim_time_ms: Option<f64>,
+) -> Result<TraceSimulationReport> {
+    let started_at = Instant::now();
+    let args = args.normalized()?;
+    let pending = normalize_trace_requests(requests, arrival_speedup_ratio)?;
+    let (collector, _) = AggRuntime::new_with_latency_model(
+        &args,
+        latency_model,
+        router_config,
+        prefill_load_estimator,
+        pending,
+        num_workers,
+        AggReplayMode::Trace,
+        router_mode,
+    )?
+    .with_per_request_records(record_per_request)
+    .with_max_sim_time_ms(max_sim_time_ms)
+    .run()?;
+    Ok(finish_with_replay_wall_time(collector, started_at))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_concurrency_multi_with_latency_model<M: ReplayLatencyModel>(
+    args: MockEngineArgs,
+    latency_model: Arc<M>,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    max_in_flight: usize,
+    num_workers: usize,
+    router_mode: ReplayRouterMode,
+    record_per_request: bool,
+    max_sim_time_ms: Option<f64>,
+) -> Result<TraceSimulationReport> {
+    let started_at = Instant::now();
+    let args = args.normalized()?;
+    let pending = VecDeque::from(requests);
+    let (collector, _) = AggRuntime::new_with_latency_model(
+        &args,
+        latency_model,
+        router_config,
+        prefill_load_estimator,
+        pending,
+        num_workers,
+        AggReplayMode::Concurrency { max_in_flight },
         router_mode,
     )?
     .with_per_request_records(record_per_request)

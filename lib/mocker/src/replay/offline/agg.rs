@@ -21,6 +21,7 @@ use super::{
     },
     state::AggRequestState,
 };
+use crate::common::perf_model::{PerfModel, ReplayLatencyModel};
 use crate::common::protocols::{DirectRequest, ForwardPassSnapshot, MockEngineArgs, OutputSignal};
 use crate::loadgen::{ReplayRequestHashes, WorkloadDriver};
 use crate::replay::{ReplayPrefillLoadEstimator, ReplayRouterMode, TraceCollector};
@@ -31,6 +32,7 @@ use rustc_hash::FxHashMap;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::{BinaryHeap, VecDeque};
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -60,13 +62,13 @@ struct AggRuntimeSnapshot {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct AggRuntimeStats;
 
-pub(in crate::replay) struct AggRuntime {
+pub(in crate::replay) struct AggRuntime<M: ReplayLatencyModel = PerfModel> {
     now_ms: f64,
     next_worker_idx: usize,
     next_event_seq: u64,
     admission: AdmissionQueue,
     requests: FxHashMap<Uuid, AggRequestState>,
-    engine: EngineComponent,
+    engine: EngineComponent<M>,
     collector: TraceCollector,
     events: BinaryHeap<SimulationEvent>,
     router: Option<OfflineReplayRouter>,
@@ -86,8 +88,7 @@ pub(in crate::replay) struct AggRuntime {
     stepped: bool,
 }
 
-impl AggRuntime {
-    /// Create an aggregated offline runtime seeded from an explicit request queue.
+impl AggRuntime<PerfModel> {
     pub(in crate::replay) fn new(
         args: &MockEngineArgs,
         router_config: Option<KvRouterConfig>,
@@ -97,17 +98,18 @@ impl AggRuntime {
         mode: ReplayMode,
         router_mode: ReplayRouterMode,
     ) -> anyhow::Result<Self> {
-        Self::new_with_source(
+        Self::new_with_latency_model(
             args,
+            Arc::clone(&args.perf_model),
             router_config,
             prefill_load_estimator,
-            AdmissionQueue::new_requests(pending, mode),
+            pending,
             num_workers,
+            mode,
             router_mode,
         )
     }
 
-    /// Create an aggregated offline runtime whose admissions come from a workload driver.
     pub(in crate::replay) fn new_workload(
         args: &MockEngineArgs,
         router_config: Option<KvRouterConfig>,
@@ -117,8 +119,58 @@ impl AggRuntime {
         mode: ReplayMode,
         router_mode: ReplayRouterMode,
     ) -> anyhow::Result<Self> {
+        Self::new_workload_with_latency_model(
+            args,
+            Arc::clone(&args.perf_model),
+            router_config,
+            prefill_load_estimator,
+            driver,
+            num_workers,
+            mode,
+            router_mode,
+        )
+    }
+}
+
+impl<M: ReplayLatencyModel> AggRuntime<M> {
+    /// Create an aggregated offline runtime seeded from an explicit request queue.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::replay) fn new_with_latency_model(
+        args: &MockEngineArgs,
+        latency_model: Arc<M>,
+        router_config: Option<KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        pending: VecDeque<DirectRequest>,
+        num_workers: usize,
+        mode: ReplayMode,
+        router_mode: ReplayRouterMode,
+    ) -> anyhow::Result<Self> {
         Self::new_with_source(
             args,
+            Arc::clone(&latency_model),
+            router_config,
+            prefill_load_estimator,
+            AdmissionQueue::new_requests(pending, mode),
+            num_workers,
+            router_mode,
+        )
+    }
+
+    /// Create an aggregated offline runtime whose admissions come from a workload driver.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::replay) fn new_workload_with_latency_model(
+        args: &MockEngineArgs,
+        latency_model: Arc<M>,
+        router_config: Option<KvRouterConfig>,
+        prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+        driver: WorkloadDriver,
+        num_workers: usize,
+        mode: ReplayMode,
+        router_mode: ReplayRouterMode,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_source(
+            args,
+            Arc::clone(&latency_model),
             router_config,
             prefill_load_estimator,
             AdmissionQueue::new_workload(driver, mode),
@@ -130,6 +182,7 @@ impl AggRuntime {
     /// Shared constructor for both raw-request and workload-driven admissions.
     fn new_with_source(
         args: &MockEngineArgs,
+        latency_model: Arc<M>,
         router_config: Option<KvRouterConfig>,
         prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
         admission: AdmissionQueue,
@@ -153,15 +206,17 @@ impl AggRuntime {
             EnginePassMode::Visible,
             (0..num_workers)
                 .map(|worker_idx| {
-                    super::state::OfflineWorkerState::new(
+                    super::state::OfflineWorkerState::new_with_latency_model(
                         worker_idx,
                         args.clone(),
                         capture_kv_events,
+                        Arc::clone(&latency_model),
                     )
                 })
                 .collect(),
+            Arc::clone(&latency_model),
         );
-        engine.set_scaling_args(args, capture_kv_events);
+        engine.set_scaling_args(args, capture_kv_events, latency_model);
 
         Ok(Self {
             now_ms: 0.0,

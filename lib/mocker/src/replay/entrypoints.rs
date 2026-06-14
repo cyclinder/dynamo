@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use dynamo_kv_router::config::KvRouterConfig;
@@ -16,6 +17,7 @@ use super::{
     OfflineDisaggReplayConfig, ReplayPrefillLoadEstimator, ReplayRouterMode, ReplayWorkerArtifacts,
     TraceSimulationReport,
 };
+use crate::common::perf_model::ReplayLatencyModel;
 use crate::common::protocols::{DirectRequest, MockEngineArgs};
 use crate::loadgen::{AgenticTrace, Trace, TraceFileFormat};
 
@@ -449,6 +451,37 @@ pub fn simulate_trace_requests_with_router_mode(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_trace_requests_with_latency_model<M: ReplayLatencyModel>(
+    latency_model: Arc<M>,
+    args: MockEngineArgs,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    num_workers: usize,
+    arrival_speedup_ratio: f64,
+    router_mode: ReplayRouterMode,
+) -> Result<TraceSimulationReport> {
+    let args = args.normalized()?;
+    validate_offline_replay_args(&args, num_workers, router_mode)?;
+    if requests.is_empty() {
+        bail!("trace replay requires at least one request");
+    }
+
+    crate::replay::offline::simulate_trace_with_latency_model(
+        args,
+        latency_model,
+        router_config,
+        prefill_load_estimator,
+        requests,
+        num_workers,
+        arrival_speedup_ratio,
+        router_mode,
+        false,
+        None,
+    )
+}
+
 pub fn simulate_trace_requests_disagg_with_router_mode(
     config: OfflineDisaggReplayConfig,
     router_config: Option<KvRouterConfig>,
@@ -852,6 +885,37 @@ pub fn simulate_concurrency_requests_with_router_mode(
 
     crate::replay::offline::simulate_concurrency(
         args,
+        router_config,
+        prefill_load_estimator,
+        requests,
+        max_in_flight,
+        num_workers,
+        router_mode,
+        false,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_concurrency_requests_with_latency_model<M: ReplayLatencyModel>(
+    latency_model: Arc<M>,
+    args: MockEngineArgs,
+    router_config: Option<KvRouterConfig>,
+    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    requests: Vec<DirectRequest>,
+    max_in_flight: usize,
+    num_workers: usize,
+    router_mode: ReplayRouterMode,
+) -> Result<TraceSimulationReport> {
+    let args = args.normalized()?;
+    validate_offline_concurrency_args(&args, num_workers, max_in_flight, router_mode)?;
+    if requests.is_empty() {
+        bail!("concurrency replay requires at least one request");
+    }
+
+    crate::replay::offline::simulate_concurrency_with_latency_model(
+        args,
+        latency_model,
         router_config,
         prefill_load_estimator,
         requests,

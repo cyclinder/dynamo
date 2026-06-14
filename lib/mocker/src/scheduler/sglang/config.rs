@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
-use crate::common::perf_model::PerfModel;
 use crate::common::protocols::{MockEngineArgs, WorkerType};
 
 const DEFAULT_MAX_PREFILL_TOKENS: usize = 16384;
@@ -31,7 +28,6 @@ pub(super) struct SglangConfig {
     pub(super) init_new_token_ratio: f64,
     pub(super) min_new_token_ratio: f64,
     pub(super) new_token_ratio_decay_step: f64,
-    pub(super) perf_model: Arc<PerfModel>,
     pub(super) speedup_ratio: f64,
     pub(super) decode_speedup_ratio: f64,
     pub(super) worker_type: WorkerType,
@@ -80,7 +76,6 @@ impl SglangConfig {
             init_new_token_ratio,
             min_new_token_ratio,
             new_token_ratio_decay_step: decay_step,
-            perf_model: args.perf_model.clone(),
             speedup_ratio: args.speedup_ratio,
             decode_speedup_ratio: args.decode_speedup_ratio,
             worker_type: args.worker_type,

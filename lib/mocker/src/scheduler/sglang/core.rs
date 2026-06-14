@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use dynamo_kv_router::protocols::WorkerId;
 use uuid::Uuid;
 
+use crate::common::perf_model::{
+    PerfModel, ReplayLatencyModel, ReplayPrefillInput, normalize_replay_latency_ms,
+};
 use crate::common::protocols::{DirectRequest, KvEventPublishers, MockEngineArgs, WorkerType};
 use crate::common::speculative::{SpeculativeDecodeSampler, normalize_conditional_accept_rates};
 use crate::kv_manager::SglangKvManager;
@@ -22,8 +26,9 @@ use crate::scheduler::{
     accept_length_sample, build_fpm_snapshot, capture_router_event_sink,
 };
 
-pub(crate) struct SglangCore {
+pub(crate) struct SglangCore<M: ReplayLatencyModel = PerfModel> {
     pub(super) config: SglangConfig,
+    latency_model: Arc<M>,
     dp_rank: u32,
     pub(super) waiting: VecDeque<SglangRequest>,
     pub(super) running: Vec<SglangRequest>,
@@ -33,24 +38,16 @@ pub(crate) struct SglangCore {
     kv_event_buffer: Option<CapturedRouterEventBuffer>,
 }
 
-impl SglangCore {
+#[cfg_attr(not(test), allow(dead_code))]
+impl SglangCore<PerfModel> {
     pub(crate) fn new(args: MockEngineArgs) -> Self {
-        Self::new_internal(args, 0, 0, None, KvEventPublishers::default())
-    }
-
-    pub(crate) fn new_with_worker_id(args: MockEngineArgs, worker_id: WorkerId) -> Self {
-        Self::new_internal(args, 0, worker_id, None, KvEventPublishers::default())
+        let latency_model = Arc::clone(&args.perf_model);
+        Self::new_with_latency_model(args, latency_model)
     }
 
     pub(crate) fn new_with_kv_capture(args: MockEngineArgs, worker_id: WorkerId) -> Self {
-        let (buffer, sink) = capture_router_event_sink(worker_id);
-        Self::new_internal(
-            args,
-            0,
-            worker_id,
-            Some(buffer),
-            KvEventPublishers::new(Some(sink), None),
-        )
+        let latency_model = Arc::clone(&args.perf_model);
+        Self::new_with_kv_capture_and_latency_model(args, worker_id, latency_model)
     }
 
     pub(super) fn new_with_sink(
@@ -58,11 +55,73 @@ impl SglangCore {
         dp_rank: u32,
         kv_event_publishers: KvEventPublishers,
     ) -> Self {
-        Self::new_internal(args, dp_rank, u64::from(dp_rank), None, kv_event_publishers)
+        let latency_model = Arc::clone(&args.perf_model);
+        Self::new_with_sink_and_latency_model(args, dp_rank, kv_event_publishers, latency_model)
+    }
+}
+
+impl<M: ReplayLatencyModel> SglangCore<M> {
+    pub(crate) fn new_with_latency_model(args: MockEngineArgs, latency_model: Arc<M>) -> Self {
+        Self::new_internal(
+            args,
+            latency_model,
+            0,
+            0,
+            None,
+            KvEventPublishers::default(),
+        )
+    }
+
+    pub(crate) fn new_with_worker_id_and_latency_model(
+        args: MockEngineArgs,
+        worker_id: WorkerId,
+        latency_model: Arc<M>,
+    ) -> Self {
+        Self::new_internal(
+            args,
+            latency_model,
+            0,
+            worker_id,
+            None,
+            KvEventPublishers::default(),
+        )
+    }
+
+    pub(crate) fn new_with_kv_capture_and_latency_model(
+        args: MockEngineArgs,
+        worker_id: WorkerId,
+        latency_model: Arc<M>,
+    ) -> Self {
+        let (buffer, sink) = capture_router_event_sink(worker_id);
+        Self::new_internal(
+            args,
+            latency_model,
+            0,
+            worker_id,
+            Some(buffer),
+            KvEventPublishers::new(Some(sink), None),
+        )
+    }
+
+    pub(super) fn new_with_sink_and_latency_model(
+        args: MockEngineArgs,
+        dp_rank: u32,
+        kv_event_publishers: KvEventPublishers,
+        latency_model: Arc<M>,
+    ) -> Self {
+        Self::new_internal(
+            args,
+            latency_model,
+            dp_rank,
+            u64::from(dp_rank),
+            None,
+            kv_event_publishers,
+        )
     }
 
     fn new_internal(
         args: MockEngineArgs,
+        latency_model: Arc<M>,
         dp_rank: u32,
         worker_id: WorkerId,
         kv_event_buffer: Option<CapturedRouterEventBuffer>,
@@ -80,6 +139,7 @@ impl SglangCore {
 
         Self {
             config,
+            latency_model,
             dp_rank,
             waiting: VecDeque::new(),
             running: Vec::new(),
@@ -162,8 +222,14 @@ impl SglangCore {
         } else {
             0
         };
-        let prefill_time =
-            simulate_prefill_duration(batch_size, mean_isl, mean_prefix, &self.config, true);
+        let prefill_time = simulate_prefill_duration(
+            batch_size,
+            mean_isl,
+            mean_prefix,
+            &self.config,
+            self.latency_model.as_ref(),
+            true,
+        );
 
         for mut req in admit.can_run {
             if req.materialized_tokens < req.current_sequence_len() {
@@ -186,6 +252,7 @@ impl SglangCore {
             &mut self.running,
             &mut self.kv_manager,
             &self.config,
+            self.latency_model.as_ref(),
             self.speculative_sampler.as_mut(),
             decode_start_ms,
             true,
@@ -288,20 +355,27 @@ impl SglangCore {
     }
 }
 
-fn simulate_prefill_duration(
+fn simulate_prefill_duration<M: ReplayLatencyModel>(
     batch_size: usize,
     mean_isl: usize,
     mean_prefix: usize,
     config: &SglangConfig,
+    latency_model: &M,
     apply_speedup: bool,
 ) -> Duration {
     if batch_size == 0 || config.worker_type == WorkerType::Decode {
         return Duration::ZERO;
     }
 
-    let prefill_time = config
-        .perf_model
-        .predict_prefill_time(batch_size, mean_isl, mean_prefix);
+    let prefill_time = normalize_replay_latency_ms(
+        latency_model.prefill_latency_ms(ReplayPrefillInput {
+            batch_size,
+            input_sequence_length: mean_isl,
+            prefix_length: mean_prefix,
+        }),
+        0.0,
+        "prefill",
+    );
     let total_time = Duration::from_secs_f64(prefill_time / 1000.0);
 
     if !apply_speedup || config.speedup_ratio <= 0.0 || total_time <= Duration::ZERO {
