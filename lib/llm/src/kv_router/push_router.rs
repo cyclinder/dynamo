@@ -38,7 +38,7 @@ use selection::{RoutingRequestParts, WorkerSelection};
 pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     pub chooser: Arc<KvRouter>,
-    /// Sticky session routing. Lazily activated when requests carry session_control.
+    /// Sticky routing for trajectory-scoped radix tags.
     pub(super) sticky: Arc<StickySessionCoordinator>,
 }
 
@@ -300,8 +300,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         drop(route_guard);
         guard.start_dispatch(&phase_label);
 
-        // Session lifecycle RPCs.
-        // Fails fast if session_control.open is requested but the client can't be created.
+        // Session lifecycle RPCs. Open is implicit; close releases the worker's
+        // radix tag after the final response drains.
         let worker = WorkerWithDpRank::new(instance_id, dp_rank);
         let route_outcome = cancel_on_stop(
             request_context.as_ref(),

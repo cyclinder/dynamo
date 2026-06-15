@@ -103,6 +103,7 @@ impl StickySessionCoordinator {
             });
         };
         let Some(action) = sc.action.as_ref() else {
+            self.bind_with_kind(sc, worker, AffinityKind::EngineBacked);
             return Ok(SessionRoutingResult {
                 deferred_close: None,
             });

@@ -570,10 +570,9 @@ pub struct NvExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timestamp_ms: Option<f64>,
 
-    /// Session control for subagent KV isolation and sticky routing.
-    /// When present, the router uses `session_id` for worker affinity.
-    /// When `action` is set to `open` or `close`, the router also fires
-    /// session lifecycle RPCs to the worker.
+    /// Deprecated explicit session control for sticky routing.
+    /// Prefer `agent_context.trajectory_id`; the preprocessor derives the
+    /// internal routing key from it and closes on `trajectory_final`.
     #[builder(default, setter(strip_option))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_control: Option<SessionControl>,
@@ -636,10 +635,10 @@ fn default_session_timeout() -> u64 {
     300
 }
 
-/// Session control for subagent KV isolation and sticky routing.
+/// Deprecated explicit session control for sticky routing.
 ///
 /// Always requires `session_id`. The `action` field is optional:
-/// - `action: "open"` on the first turn creates a streaming session on the worker
+/// - `action: "open"` on the first turn binds affinity; worker open is implicit
 /// - `action: "bind"` creates router-only sticky affinity without worker RPCs
 /// - `action: "close"` on the last turn frees session KV after generation
 /// - No `action` on intermediate turns -- just provides `session_id` for sticky routing

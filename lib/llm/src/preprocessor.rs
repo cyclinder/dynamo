@@ -97,6 +97,20 @@ fn routing_priorities(
     (priority_jump, strict_priority, priority)
 }
 
+fn agent_context_session_control(
+    nvext: &crate::protocols::openai::nvext::NvExt,
+) -> Option<crate::protocols::openai::nvext::SessionControl> {
+    let agent_context = nvext.agent_context.as_ref()?;
+    Some(crate::protocols::openai::nvext::SessionControl {
+        session_id: agent_context.trajectory_id.clone(),
+        action: agent_context
+            .trajectory_final
+            .is_some_and(|is_final| is_final)
+            .then_some(crate::protocols::openai::nvext::SessionAction::Close),
+        timeout: 300,
+    })
+}
+
 /// Encode a slice of `f32` values as a base64 string per the OpenAI
 /// `encoding_format=base64` spec: the raw little-endian byte
 /// representation of each `f32` is concatenated and the resulting byte
@@ -850,7 +864,8 @@ impl OpenAIPreprocessor {
                 priority,
                 lora_name,
                 allowed_worker_ids: None,
-                session_control: nvext.session_control.clone(),
+                session_control: agent_context_session_control(nvext)
+                    .or_else(|| nvext.session_control.clone()),
                 routing_constraints: nvext.routing_constraints.clone(),
             };
             builder.routing(Some(routing));
@@ -3219,6 +3234,7 @@ mod strip_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::openai::nvext::{NvExt, SessionAction};
 
     #[test]
     fn routing_priorities_keep_strict_tier_independent() {
@@ -3381,6 +3397,39 @@ mod tests {
             extra_args["sampling_options"]["bad_words_token_ids"],
             serde_json::json!([[12, 13]])
         );
+    }
+
+    #[test]
+    fn test_agent_context_session_control_uses_trajectory_id() {
+        let nvext: NvExt = serde_json::from_value(serde_json::json!({
+            "agent_context": {
+                "session_type_id": "deep_research:v1",
+                "session_id": "run-123",
+                "trajectory_id": "run-123:worker-0"
+            }
+        }))
+        .unwrap();
+
+        let sc = agent_context_session_control(&nvext).unwrap();
+        assert_eq!(sc.session_id, "run-123:worker-0");
+        assert_eq!(sc.action, None);
+    }
+
+    #[test]
+    fn test_agent_context_session_control_closes_on_trajectory_final() {
+        let nvext: NvExt = serde_json::from_value(serde_json::json!({
+            "agent_context": {
+                "session_type_id": "deep_research:v1",
+                "session_id": "run-123",
+                "trajectory_id": "run-123:worker-0",
+                "trajectory_final": true
+            }
+        }))
+        .unwrap();
+
+        let sc = agent_context_session_control(&nvext).unwrap();
+        assert_eq!(sc.session_id, "run-123:worker-0");
+        assert_eq!(sc.action, Some(SessionAction::Close));
     }
 
     #[test]
