@@ -1054,6 +1054,42 @@ class TestApplyCap(unittest.TestCase):
         metrics.applied_limit_watts.labels.assert_called_with(gpu="0")
         metrics.applied_limit_watts.labels.return_value.set.assert_called_with(300)
         metrics.apply_failures_total.inc.assert_not_called()
+        # The capped UUID is recorded in the ownership set the SIGTERM sweep
+        # restricts to.
+        self.assertEqual(actuator.managed_uuids(), {"GPU-x"})
+
+    def test_recap_after_reenumeration_keeps_displaced_uuid_owned(self):
+        """The core of sttts's leak: the index-keyed `_managed_uuid_by_idx`
+        is overwritten when a re-enumerated index is re-capped, but the
+        append-only ownership set (`managed_uuids`) must retain the displaced
+        UUID so the SIGTERM sweep can still find and restore it."""
+        metrics = MagicMock()
+        actuator, modules, handle, _ = _make_initialized_actuator(metrics=metrics)
+        discovery = handle.GetSystem.return_value.discovery
+
+        # First cap: idx 0 resolves to GPU-A.
+        discovery.GetGpuAttributes.side_effect = lambda gid: _make_gpu_attrs(
+            "GPU-A", min_w=100, max_w=700
+        )
+        with patch.dict("sys.modules", {**modules, "pynvml": MagicMock()}), patch(
+            "power_agent._persist_managed_gpus"
+        ):
+            actuator.apply_cap(0, 300)
+
+        # DCGM re-enumerates: idx 0 now resolves to GPU-B; re-cap idx 0.
+        discovery.GetGpuAttributes.side_effect = lambda gid: _make_gpu_attrs(
+            "GPU-B", min_w=100, max_w=700
+        )
+        with patch.dict("sys.modules", {**modules, "pynvml": MagicMock()}), patch(
+            "power_agent._persist_managed_gpus"
+        ):
+            actuator.apply_cap(0, 300)
+
+        # The index-keyed projection lost GPU-A (the original bug shape)...
+        self.assertEqual(actuator._managed_uuid_by_idx[0], "GPU-B")
+        # ...but the ownership set retains BOTH, so the sweep can relocate
+        # and restore the displaced GPU-A on shutdown.
+        self.assertEqual(actuator.managed_uuids(), {"GPU-A", "GPU-B"})
 
     def test_apply_cap_clamps_above_max(self):
         metrics = MagicMock()
@@ -1500,6 +1536,95 @@ class TestRestoreDefault(unittest.TestCase):
         # bookkeeping because _apply_cap_inner raises before it runs.
         self.assertNotIn(0, power_agent._managed_gpu_indices)
         metrics.applied_limit_watts.labels.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Write surface — restore_default_by_uuid (SIGTERM UUID sweep, PR9790 review)
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreDefaultByUuid(unittest.TestCase):
+    """`restore_default_by_uuid` is the SIGTERM safety net for the
+    re-enumeration re-cap collision: it resolves a UUID to its CURRENT
+    index and restores default TGP there, independent of the lossy
+    index-keyed in-memory maps."""
+
+    def test_restores_displaced_uuid_at_current_index(self):
+        """The leaked GPU from sttts's trace: UUID A was capped at idx 0,
+        DCGM re-enumerated A to idx 1, and idx 0 was re-capped onto B
+        (overwriting `_managed_uuid_by_idx[0]`). Sweeping UUID A must
+        restore it at its current index 1, below default."""
+        actuator, modules, handle, _ = _make_initialized_actuator(metrics=MagicMock())
+        discovery = handle.GetSystem.return_value.discovery
+        actuator._discovered_gpu_ids = [20, 10]
+        discovery.GetGpuAttributes.side_effect = lambda gid: {
+            10: _make_gpu_attrs("GPU-A", default_w=410, current_w=300),
+            20: _make_gpu_attrs("GPU-B", default_w=620, current_w=620),
+        }[gid]
+
+        with patch.dict("sys.modules", {**modules, "pynvml": MagicMock()}), patch(
+            "power_agent._persist_managed_gpus"
+        ):
+            result = actuator.restore_default_by_uuid("GPU-A")
+
+        self.assertTrue(result)
+        cfg = modules["pydcgm"].DcgmGroup.return_value.config.Set.call_args.args[0]
+        self.assertEqual(cfg.mPowerLimit.val, 410)
+        modules["pydcgm"].DcgmGroup.return_value.AddGpu.assert_called_with(10)
+
+    def test_returns_none_when_already_at_default(self):
+        """UUID resolves but the GPU is already at/above default — we hold
+        no live cap, so return None (caller prunes) and issue no write."""
+        actuator, modules, handle, _ = _make_initialized_actuator(metrics=MagicMock())
+        discovery = handle.GetSystem.return_value.discovery
+        actuator._discovered_gpu_ids = [10]
+        discovery.GetGpuAttributes.side_effect = lambda gid: _make_gpu_attrs(
+            "GPU-A", default_w=410, current_w=410
+        )
+
+        with patch.dict("sys.modules", {**modules, "pynvml": MagicMock()}):
+            result = actuator.restore_default_by_uuid("GPU-A")
+
+        self.assertIsNone(result)
+        modules["pydcgm"].DcgmGroup.return_value.config.Set.assert_not_called()
+
+    def test_returns_none_when_uuid_gone_after_clean_scan(self):
+        """A clean scan with no match proves the GPU left the node; its cap
+        left with it, so return None (safe to prune) with no write."""
+        actuator, modules, handle, _ = _make_initialized_actuator(metrics=MagicMock())
+        discovery = handle.GetSystem.return_value.discovery
+        actuator._discovered_gpu_ids = [20]
+        discovery.GetGpuAttributes.side_effect = lambda gid: _make_gpu_attrs(
+            "GPU-B", default_w=620, current_w=620
+        )
+
+        with patch.dict("sys.modules", {**modules, "pynvml": MagicMock()}):
+            result = actuator.restore_default_by_uuid("GPU-A")
+
+        self.assertIsNone(result)
+        modules["pydcgm"].DcgmGroup.return_value.config.Set.assert_not_called()
+
+    def test_returns_false_when_scan_incomplete(self):
+        """A relocation-scan probe raising (transient DCGM outage) is NOT
+        proof the GPU is gone. Return False so the caller KEEPS the UUID for
+        cold-start orphan recovery rather than pruning a possibly-live cap."""
+        actuator, modules, handle, _ = _make_initialized_actuator(metrics=MagicMock())
+        discovery = handle.GetSystem.return_value.discovery
+        actuator._discovered_gpu_ids = [20, 30]
+
+        def _attrs(gid):
+            if gid == 20:
+                return _make_gpu_attrs("GPU-B", default_w=620, current_w=620)
+            raise RuntimeError("hostengine blip on gpu_id 30")
+
+        discovery.GetGpuAttributes.side_effect = _attrs
+
+        with patch.dict("sys.modules", {**modules, "pynvml": MagicMock()}):
+            with self.assertLogs("power_agent.actuator", level="WARNING"):
+                result = actuator.restore_default_by_uuid("GPU-A")
+
+        self.assertFalse(result)
+        modules["pydcgm"].DcgmGroup.return_value.config.Set.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

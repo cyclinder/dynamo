@@ -393,6 +393,19 @@ class DcgmActuator:
         # restore can relocate the physical GPU before writing default TGP.
         self._managed_uuid_by_idx: dict[int, str] = {}
 
+        # Append-only set of every UUID THIS process capped. Unlike
+        # `_managed_uuid_by_idx` (keyed by the unstable integer index, so a
+        # re-cap of a re-enumerated index overwrites the prior UUID) and
+        # `_managed_gpu_indices` (a set of indices that can't represent two
+        # GPUs that occupied one index at different times), this never loses
+        # an entry on re-enumeration. It is the OWNERSHIP filter for the
+        # SIGTERM UUID sweep: the persisted `_previously_managed` set is
+        # cross-incarnation (it can hold UUIDs orphan recovery kept but this
+        # process never capped, e.g. GPUs with a running workload), so the
+        # sweep must restrict to UUIDs we actually capped to avoid resetting
+        # a cap owned by another workflow. See `_handle_sigterm`.
+        self._capped_uuids: set[str] = set()
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -1025,6 +1038,9 @@ class DcgmActuator:
         try:
             uuid = self.get_uuid(gpu_idx)
             self._managed_uuid_by_idx[gpu_idx] = uuid
+            # Ownership record for the SIGTERM sweep (never overwritten on
+            # re-enumeration, unlike `_managed_uuid_by_idx[gpu_idx]`).
+            self._capped_uuids.add(uuid)
             power_agent._record_managed_gpu_by_uuid(uuid)
         except Exception as e:
             # UUID lookup failure is non-fatal: the cap was applied,
@@ -1051,6 +1067,68 @@ class DcgmActuator:
             return False
         self._apply_cap_inner(restore_idx, self.default_w(restore_idx))
         return True
+
+    def managed_uuids(self) -> set[str]:
+        """UUIDs THIS process capped — the ownership scope for the SIGTERM
+        UUID sweep. A copy so callers can iterate while pruning the
+        persisted set. See `_capped_uuids` and `_handle_sigterm`."""
+        return set(self._capped_uuids)
+
+    def restore_default_by_uuid(self, uuid: str) -> Optional[bool]:
+        """Restore the originally-capped `uuid` at its CURRENT index.
+
+        SIGTERM safety net for the re-enumeration re-cap collision raised
+        in PR9790 review. The in-memory managed maps (`_managed_gpu_indices`,
+        `_managed_uuid_by_idx`) are keyed by integer index, so re-capping an
+        index that DCGM re-enumerated onto a *different* physical GPU
+        overwrites the displaced GPU's record:
+
+            1. cap GPU-A at idx 0  -> indices={0}, uuid_by_idx={0: A}
+            2. DCGM reconnect re-enumerates -> idx 0 is now GPU-B, A moved
+            3. re-cap idx 0 (now GPU-B) -> uuid_by_idx[0] overwritten to B;
+               the index set still just holds {0}, so A is no longer
+               reachable from the index-keyed SIGTERM loop and its cap
+               leaks if the agent is removed without a restart.
+
+        The displaced UUID survives in the append-only `_capped_uuids`
+        ownership set, so `power_agent._handle_sigterm` sweeps
+        `managed_uuids()` through here after the index loop to catch any cap
+        the index-keyed pass missed. Identity is resolved at restore time,
+        so the write always lands on the GPU that actually carries the cap.
+        Scoping to `_capped_uuids` (rather than the cross-incarnation
+        `managed_gpus.json` set) keeps the sweep from resetting a cap this
+        process never applied.
+
+        Returns (the caller prunes `uuid` from the persisted set ONLY on
+        ``True`` — see `power_agent._handle_sigterm` for why ``None`` is
+        intentionally kept rather than pruned):
+          * ``True``  - a live below-default cap was restored.
+          * ``None``  - the UUID resolved but the GPU is already at/above
+            default (no live cap of ours to restore), or a clean scan
+            proved the GPU is no longer present. Nothing to restore.
+          * ``False`` - the UUID could not be located conclusively (a
+            relocation scan probe raised, e.g. a transient DCGM outage), so
+            the GPU may still carry our cap; cold-start orphan recovery
+            retries on the next boot.
+        """
+        idx, scan_complete = self._resolve_idx_for_uuid(uuid)
+        if idx is None:
+            # Clean scan with no match -> the GPU is gone and its cap left
+            # with it (safe to prune). Incomplete scan -> indeterminate, so
+            # keep the UUID for the next orphan-recovery attempt.
+            return None if scan_complete else False
+        if self.current_w(idx) < self.default_w(idx):
+            self._apply_cap_inner(idx, self.default_w(idx))
+            logger.warning(
+                "SIGTERM UUID sweep restored a cap the index-keyed pass "
+                "missed: UUID %s now at index %d (DCGM re-enumeration "
+                "re-cap collision).",
+                uuid,
+                idx,
+            )
+            return True
+        # Visible and already at/above default: nothing of ours to restore.
+        return None
 
     def managed_uuid_for_idx(self, gpu_idx: int) -> str:
         """Return the UUID originally capped for `gpu_idx`, if known.

@@ -496,6 +496,56 @@ def _handle_sigterm(signum, frame):
             continue
         if restored_uuid is not None:
             _previously_managed.discard(restored_uuid)
+
+    # UUID-complete safety net (PR9790 review follow-up). The index-keyed
+    # loop above can MISS a still-capped GPU when DCGM re-enumerated and a
+    # later reconcile re-capped that GPU's old index onto a *different*
+    # physical GPU: `_managed_uuid_by_idx[old_idx]` gets overwritten and the
+    # displaced GPU drops out of the index-keyed `_managed_gpu_indices`, so
+    # the loop never visits it. Resolve each UUID we capped to its CURRENT
+    # index instead. Without this, the displaced cap leaks whenever the agent
+    # is removed without a restart (no future orphan recovery runs).
+    #
+    # Scope the sweep to `actuator.managed_uuids()` — the UUIDs THIS process
+    # actually capped — NOT the persisted `_previously_managed` set. The
+    # latter is cross-incarnation and can hold UUIDs that startup orphan
+    # recovery KEPT but this process never capped (e.g. a GPU with a running
+    # workload, skipped at `_restore_orphaned_gpus_on_startup`'s
+    # `list_running_pids` guard). Sweeping those would reset a cap owned by
+    # another workflow on shutdown; `current_w < default_w` prevents a
+    # redundant write but is not an ownership guard.
+    #
+    # Only the DCGM actuator can relocate by UUID; NVML indices are stable
+    # within a process so its index loop is already complete. Gate on the
+    # capability the same way the prune above gates on `managed_uuid_for_idx`.
+    if actuator is not None and hasattr(type(actuator), "restore_default_by_uuid"):
+        for uuid in getattr(actuator, "managed_uuids")():
+            try:
+                sweep_result = getattr(actuator, "restore_default_by_uuid")(uuid)
+            except Exception as e:
+                # Keep the UUID: a write/relocation failure means the cap may
+                # still be live, and the next startup's orphan recovery is our
+                # only remaining chance to reset it.
+                logger.exception(
+                    "SIGTERM UUID sweep failed to restore managed UUID %s: %s",
+                    uuid,
+                    e,
+                )
+                continue
+            # Prune ONLY when we actively restored a live below-default cap
+            # (True), mirroring the index loop's invariant: "discard a UUID
+            # only after restoring its GPU to default." A stale persisted
+            # UUID that resolves to an already-at-default GPU, a GPU that
+            # left the node, or one we could not locate conclusively
+            # (None / False) is left in place — exactly as orphan recovery
+            # leaves at-default UUIDs (`_restore_orphaned_gpus_on_startup`
+            # only discards when `current_w < default_w`). This keeps the
+            # sweep from aggressively dropping persisted UUIDs it did not
+            # just act on, which `_previously_managed` legitimately holds
+            # across incarnations.
+            if sweep_result is True:
+                _previously_managed.discard(uuid)
+
     # Persist the pruned state so the next startup's orphan recovery
     # only touches GPUs we still own. Failure to write is non-fatal:
     # log and proceed to shutdown.

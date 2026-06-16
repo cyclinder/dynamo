@@ -438,5 +438,204 @@ class TestSigtermPrunesManagedGpusState(_SigtermTestBase):
         self.assertTrue(power_agent._shutdown.is_set())
 
 
+class TestSigtermDcgmUuidSweep(_SigtermTestBase):
+    """PR9790 review follow-up (@sttts): the index-keyed restore loop can
+    MISS a still-capped GPU when DCGM re-enumerated and a later reconcile
+    re-capped its old index onto a different physical GPU. The displaced
+    UUID survives in the per-process ownership set, so SIGTERM sweeps
+    `actuator.managed_uuids()` through `restore_default_by_uuid` to catch
+    the leak.
+
+    Critically (per the independent review caveat), the sweep is scoped to
+    UUIDs THIS process capped — not the cross-incarnation `_previously_managed`
+    set — and prunes ONLY on a True (restored-a-live-cap) result, matching
+    the index loop's and orphan recovery's invariants.
+    """
+
+    class _SweepActuator:
+        """DCGM-like actuator exposing the UUID sweep surface.
+
+        `owned` is the set of UUIDs THIS process capped (what
+        `managed_uuids()` returns) — the ownership scope the sweep must
+        respect. It is intentionally distinct from the persisted
+        `_previously_managed` set so tests can pin that cross-incarnation
+        entries are never swept.
+        """
+
+        name = "dcgm"
+
+        def __init__(
+            self, *, owned=None, sweep_results=None, idx_uuid=None, sweep_raises=()
+        ):
+            self.shutdown = MagicMock()
+            self.restore_default = MagicMock(return_value=True)
+            self._owned = set(owned or [])
+            self._sweep_results = sweep_results or {}
+            self._idx_uuid = idx_uuid or {}
+            self._sweep_raises = set(sweep_raises)
+            self.swept = []
+
+        def get_uuid(self, gpu_idx):
+            return self._idx_uuid.get(gpu_idx)
+
+        def managed_uuid_for_idx(self, gpu_idx):
+            return self._idx_uuid.get(gpu_idx)
+
+        def managed_uuids(self):
+            return set(self._owned)
+
+        def restore_default_by_uuid(self, uuid):
+            self.swept.append(uuid)
+            if uuid in self._sweep_raises:
+                raise RuntimeError(f"DCGM write failed for {uuid}")
+            return self._sweep_results.get(uuid)
+
+    def setUp(self):
+        super().setUp()
+        self._saved_pm = power_agent._previously_managed.copy()
+        power_agent._previously_managed.clear()
+
+    def tearDown(self):
+        power_agent._previously_managed.clear()
+        power_agent._previously_managed.update(self._saved_pm)
+        super().tearDown()
+
+    def test_sweep_restores_leaked_uuid_not_in_index_set(self):
+        """sttts's exact trace: idx 0 was re-capped onto GPU-B (so the index
+        loop restores and prunes GPU-B), while the displaced GPU-A survives
+        only in `_previously_managed`. The sweep must restore GPU-A by UUID
+        and prune it."""
+        power_agent._managed_gpu_indices.add(0)
+        power_agent._previously_managed.update({"GPU-A", "GPU-B"})
+
+        actuator = self._SweepActuator(
+            owned={"GPU-A", "GPU-B"},
+            idx_uuid={0: "GPU-B"},
+            # GPU-B was already restored to default by the index loop, so the
+            # sweep sees it at default (None); GPU-A is the leaked one.
+            sweep_results={"GPU-A": True, "GPU-B": None},
+        )
+        power_agent._active_actuator = actuator
+
+        with patch.object(power_agent, "pynvml", MagicMock()):
+            with patch.object(power_agent, "_persist_managed_gpus") as persist:
+                power_agent._handle_sigterm(signal.SIGTERM, None)
+
+        # Index loop pruned GPU-B; sweep restored + pruned the leaked GPU-A.
+        self.assertEqual(set(actuator.swept), {"GPU-A", "GPU-B"})
+        self.assertEqual(power_agent._previously_managed, set())
+        persist.assert_called_once_with(set())
+        self.assertTrue(power_agent._shutdown.is_set())
+
+    def test_sweep_ignores_unowned_persisted_uuid(self):
+        """The ownership guard: a cross-incarnation UUID that startup orphan
+        recovery KEPT (e.g. a GPU with a running workload) but THIS process
+        never capped must NEVER be swept — even if it would resolve to a
+        restorable below-default cap. Resetting it on shutdown would clobber
+        a cap owned by another workflow."""
+        power_agent._previously_managed.add("uuid-foreign")
+
+        actuator = self._SweepActuator(
+            owned=set(),  # this process capped nothing
+            sweep_results={"uuid-foreign": True},  # would restore IF swept
+        )
+        power_agent._active_actuator = actuator
+
+        with patch.object(power_agent, "pynvml", MagicMock()):
+            with patch.object(power_agent, "_persist_managed_gpus") as persist:
+                power_agent._handle_sigterm(signal.SIGTERM, None)
+
+        # Never resolved/restored, and left untouched in the persisted set.
+        self.assertEqual(actuator.swept, [])
+        self.assertEqual(power_agent._previously_managed, {"uuid-foreign"})
+        persist.assert_called_once_with({"uuid-foreign"})
+
+    def test_sweep_keeps_owned_uuid_already_at_default(self):
+        """An owned UUID that resolves to an already-at-default GPU (None)
+        must be LEFT in place, not pruned — matching orphan recovery and
+        avoiding the over-aggressive drop the reviewer warned about."""
+        power_agent._previously_managed.add("uuid-mine")
+
+        actuator = self._SweepActuator(
+            owned={"uuid-mine"}, sweep_results={"uuid-mine": None}
+        )
+        power_agent._active_actuator = actuator
+
+        with patch.object(power_agent, "pynvml", MagicMock()):
+            with patch.object(power_agent, "_persist_managed_gpus") as persist:
+                power_agent._handle_sigterm(signal.SIGTERM, None)
+
+        self.assertEqual(actuator.swept, ["uuid-mine"])
+        self.assertEqual(power_agent._previously_managed, {"uuid-mine"})
+        persist.assert_called_once_with({"uuid-mine"})
+
+    def test_sweep_keeps_uuid_on_inconclusive_scan(self):
+        """A False result (transient DCGM outage / incomplete relocation
+        scan) means the GPU may still carry our cap — keep the UUID so
+        cold-start orphan recovery retries."""
+        power_agent._previously_managed.add("uuid-indeterminate")
+
+        actuator = self._SweepActuator(
+            owned={"uuid-indeterminate"},
+            sweep_results={"uuid-indeterminate": False},
+        )
+        power_agent._active_actuator = actuator
+
+        with patch.object(power_agent, "pynvml", MagicMock()):
+            with patch.object(power_agent, "_persist_managed_gpus") as persist:
+                power_agent._handle_sigterm(signal.SIGTERM, None)
+
+        self.assertEqual(power_agent._previously_managed, {"uuid-indeterminate"})
+        persist.assert_called_once_with({"uuid-indeterminate"})
+
+    def test_sweep_exception_keeps_uuid_and_still_shuts_down(self):
+        """If `restore_default_by_uuid` raises, the cap may still be live, so
+        keep the UUID; the failure is logged and shutdown still completes."""
+        power_agent._previously_managed.add("uuid-boom")
+
+        actuator = self._SweepActuator(owned={"uuid-boom"}, sweep_raises={"uuid-boom"})
+        power_agent._active_actuator = actuator
+
+        with patch.object(power_agent, "pynvml", MagicMock()):
+            with self.assertLogs("power_agent", level="ERROR") as cm:
+                with patch.object(power_agent, "_persist_managed_gpus") as persist:
+                    power_agent._handle_sigterm(signal.SIGTERM, None)
+
+        self.assertIn("uuid-boom", "\n".join(cm.output))
+        self.assertEqual(power_agent._previously_managed, {"uuid-boom"})
+        persist.assert_called_once_with({"uuid-boom"})
+        self.assertTrue(power_agent._shutdown.is_set())
+
+    def test_sweep_does_not_run_on_nvml_actuator(self):
+        """NVML indices are stable within a process, so the index loop is
+        already complete and there is no UUID-relocation surface. An NVML
+        actuator must not trigger the sweep, leaving leftover persisted
+        UUIDs untouched (handled by the next startup's orphan recovery)."""
+
+        class _NvmlLikeActuator:
+            name = "nvml"
+
+            def __init__(self):
+                self.restore_default = MagicMock(return_value=True)
+                self.shutdown = MagicMock()
+                self.get_uuid = MagicMock(return_value="uuid-managed")
+
+        power_agent._managed_gpu_indices.add(0)
+        power_agent._previously_managed.update({"uuid-managed", "uuid-leftover"})
+        actuator = _NvmlLikeActuator()
+        # Pin that the sweep surface is absent on the NVML path.
+        self.assertFalse(hasattr(type(actuator), "restore_default_by_uuid"))
+        power_agent._active_actuator = actuator
+
+        with patch.object(power_agent, "pynvml", MagicMock()):
+            with patch.object(power_agent, "_persist_managed_gpus") as persist:
+                power_agent._handle_sigterm(signal.SIGTERM, None)
+
+        # Index loop pruned the managed UUID; the leftover is preserved
+        # because no UUID sweep runs on NVML.
+        self.assertEqual(power_agent._previously_managed, {"uuid-leftover"})
+        persist.assert_called_once_with({"uuid-leftover"})
+
+
 if __name__ == "__main__":
     unittest.main()
