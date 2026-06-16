@@ -20,11 +20,21 @@ use crate::{
 
 use super::{
     lifecycle::{SessionCloseAction, SessionLifecycleController},
-    router::{AffinityBinding, AffinityKind, InMemoryAffinityStore, StickySessionRouter},
+    router::{
+        AffinityBinding, AffinityBindingToken, AffinityKind, InMemoryAffinityStore,
+        StickySessionRouter,
+    },
 };
 
 pub struct SessionRoutingResult {
     pub deferred_close: Option<SessionCloseAction>,
+    pub rollback: Option<SessionRoutingRollback>,
+}
+
+pub struct SessionRoutingRollback {
+    session_id: String,
+    binding_token: AffinityBindingToken,
+    close_opened_session: Option<SessionCloseAction>,
 }
 
 pub struct StickySessionCoordinator {
@@ -100,29 +110,57 @@ impl StickySessionCoordinator {
         let Some(sc) = sc else {
             return Ok(SessionRoutingResult {
                 deferred_close: None,
+                rollback: None,
             });
         };
         let Some(action) = sc.action.as_ref() else {
-            self.bind_with_kind(sc, worker, AffinityKind::EngineBacked);
+            self.router.bind(
+                &sc.session_id,
+                worker,
+                Duration::from_secs(sc.timeout),
+                AffinityKind::EngineBacked,
+            );
             return Ok(SessionRoutingResult {
                 deferred_close: None,
+                rollback: None,
             });
         };
 
         match action {
             SessionAction::Open => {
                 // Radix-native sessions need no engine open: the first tagged
-                // generate creates the KV. Just bind affinity; Close still fires
-                // the release RPC (EngineBacked binding).
-                self.bind_with_kind(sc, worker, AffinityKind::EngineBacked);
+                // generate creates the KV. Bind affinity only; rollback unbinds
+                // if dispatch fails before the request reaches the backend.
+                let binding_token = self.router.bind(
+                    &sc.session_id,
+                    worker,
+                    Duration::from_secs(sc.timeout),
+                    AffinityKind::EngineBacked,
+                );
+                let rollback = Some(SessionRoutingRollback {
+                    session_id: sc.session_id.clone(),
+                    binding_token,
+                    close_opened_session: None,
+                });
                 Ok(SessionRoutingResult {
                     deferred_close: None,
+                    rollback,
                 })
             }
             SessionAction::Bind => {
-                self.bind_with_kind(sc, worker, AffinityKind::RouterOnly);
+                let binding_token = self.router.bind(
+                    &sc.session_id,
+                    worker,
+                    Duration::from_secs(sc.timeout),
+                    AffinityKind::RouterOnly,
+                );
                 Ok(SessionRoutingResult {
                     deferred_close: None,
+                    rollback: Some(SessionRoutingRollback {
+                        session_id: sc.session_id.clone(),
+                        binding_token,
+                        close_opened_session: None,
+                    }),
                 })
             }
             SessionAction::Close => {
@@ -138,23 +176,19 @@ impl StickySessionCoordinator {
                 } else {
                     None
                 };
-                Ok(SessionRoutingResult { deferred_close })
+                Ok(SessionRoutingResult {
+                    deferred_close,
+                    rollback: None,
+                })
             }
         }
     }
 
-    fn bind_with_kind(
-        &self,
-        sc: &crate::protocols::openai::nvext::SessionControl,
-        worker: WorkerWithDpRank,
-        kind: AffinityKind,
-    ) {
-        let ttl = Duration::from_secs(sc.timeout);
-        match kind {
-            AffinityKind::RouterOnly => self.router.bind_router_only(&sc.session_id, worker, ttl),
-            AffinityKind::EngineBacked => {
-                self.router.bind_engine_session(&sc.session_id, worker, ttl)
-            }
+    pub fn rollback_routed(&self, rollback: SessionRoutingRollback, context_id: &str) {
+        self.router
+            .unbind_if_token(&rollback.session_id, rollback.binding_token);
+        if let Some(close) = rollback.close_opened_session {
+            close.execute(context_id);
         }
     }
 }
