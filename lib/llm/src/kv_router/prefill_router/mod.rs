@@ -49,10 +49,15 @@ pub struct PrefillRouter {
     router_mode: RouterMode,
     enforce_disagg: bool,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
-    /// Model name used to look up the worker monitor for prefill client registration
+    /// Model name (used for logging / lifecycle messages).
     model_name: String,
-    /// Namespace used to look up the correct WorkerSet's worker monitor
+    /// Namespace (used for logging / lifecycle messages).
     namespace: String,
+    /// Worker monitor for this WorkerSet, handed in at construction (the monitor and
+    /// prefill router are created together in `watcher.rs`). On activation the prefill
+    /// `Client` is attached to it so the monitor publishes the overloaded set to the
+    /// prefill pool. `None` for a disabled router.
+    worker_monitor: Option<crate::discovery::KvWorkerMonitor>,
     is_eagle: bool,
     /// Set to true when all prefill workers die. Checked in generate() to prevent
     /// routing to dead workers. Cleared on reactivation when workers rejoin.
@@ -138,9 +143,21 @@ impl
                 worker_id,
                 dp_rank,
                 bootstrap_info,
+                permit: load_permit,
             } => {
                 let topology_constraints =
                     self.preflight_kv_transfer_constraints(endpoint_id, Some(worker_id))?;
+
+                // `load_permit` was booked atomically during resolve (peek+book
+                // in one step, no select/track race). The spawned task dispatches
+                // via `direct(worker_id)`, which skips load tracking, so the
+                // permit is held across the spawned prefill to keep LL/P2C/DAW
+                // selection accurate. `None` for KV/RoundRobin/Random.
+                //
+                // RoundRobin counter advance happens inside
+                // commit_selected_prefill_worker below (gated on
+                // preselected_worker.is_none()); advancing here too would
+                // double-count RoundRobin.
 
                 // Bootstrap optimization path: spawn prefill in background
                 self.commit_selected_prefill_worker(
@@ -168,7 +185,29 @@ impl
 
                 // Pass the phase barrier to the spawned task. It is released after routing
                 // completes so worker recording finishes before phase changes to Decode.
-                self.spawn_prefill_task(prefill_context, Some(worker_id), prefill_phase_barrier);
+                let admission_rx = self.spawn_prefill_task(
+                    prefill_context,
+                    Some(worker_id),
+                    prefill_phase_barrier,
+                    load_permit,
+                );
+
+                // Await the prefill dispatch (admission) result before starting
+                // decode. If the prefill was rejected (e.g. all eligible / the
+                // pinned prefill worker overloaded -> ResourceExhausted), surface
+                // the typed error now (503) instead of detaching and letting decode
+                // proceed against a prefill that never ran. Signalled at dispatch
+                // acceptance, so this does not gate on prefill output (which would
+                // deadlock the bootstrap KV-transfer rendezvous).
+                match admission_rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "prefill task ended before signaling admission"
+                        ));
+                    }
+                }
 
                 (
                     Ok(PrefillOutcome::Bootstrap {
@@ -193,6 +232,16 @@ impl
                 // from generic resource exhaustion (operator-facing 429 vs
                 // 503) instead of stringifying through ResourceExhausted.
                 drop(prefill_phase_barrier);
+                // Capacity rejection, not a genuine failure: log at warn so it
+                // does not pollute error-rate dashboards. This is the reachable
+                // ResourceExhausted source (the Err(e) arm below stays as
+                // defense-in-depth for any future error-returning resolve path).
+                tracing::warn!(
+                    ?reason,
+                    queued_isl_tokens,
+                    ?max_queued_isl_tokens,
+                    "request rejected: prefill router backpressure (at capacity)"
+                );
                 return Err(dynamo_runtime::error::DynamoError::builder()
                     .error_type(dynamo_runtime::error::ErrorType::ResourceExhausted)
                     .message(format!(
@@ -204,6 +253,7 @@ impl
             PrefillResolveDecision::NoBootstrapEndpoint {
                 worker_id: resolved_wid,
                 dp_rank: resolved_dp_rank,
+                permit: load_permit,
             } => {
                 let topology_constraints =
                     self.preflight_kv_transfer_constraints(endpoint_id, Some(resolved_wid))?;
@@ -227,13 +277,19 @@ impl
                     request_id.clone(),
                     metadata.clone(),
                 );
+                // This branch also dispatches via `direct(resolved_wid)` (inside
+                // execute_prefill), which skips load tracking — so hold the
+                // occupancy booking across the synchronous prefill so LL/P2C/DAW
+                // load is counted here too. Dropped when prefill completes.
                 let completion = Self::execute_prefill(
                     self.prefill_router.get().cloned(),
                     prefill_context,
                     Some(resolved_wid),
                     None,
+                    None, // synchronous path: caller awaits the full completion
                 )
                 .await?;
+                drop(load_permit);
                 (
                     Ok(PrefillOutcome::Completed {
                         result: completion.result,
@@ -242,6 +298,13 @@ impl
                     }),
                     topology_constraints,
                 )
+            }
+            PrefillResolveDecision::Rejected(error) => {
+                // All eligible prefill workers are overloaded. Surface the typed
+                // (ResourceExhausted) rejection unchanged instead of falling back
+                // to the synchronous prefill path.
+                drop(prefill_phase_barrier);
+                return Err(error);
             }
             PrefillResolveDecision::Unavailable | PrefillResolveDecision::NotActivated => {
                 let topology_constraints =
@@ -268,6 +331,7 @@ impl
                     prefill_context,
                     preselected_worker,
                     None,
+                    None, // synchronous path: caller awaits the full completion
                 )
                 .await?;
                 let prefill_worker_id = completion
@@ -359,7 +423,12 @@ impl
                 Err(anyhow::anyhow!(PrefillError::NotActivated))
             }
             Err(e) => {
-                tracing::error!(error = %e, "Remote prefill failed, failing request");
+                use dynamo_runtime::error::{ErrorType, match_error_chain};
+                if match_error_chain(&e, &[ErrorType::ResourceExhausted], &[]) {
+                    tracing::warn!(error = %e, "request rejected by prefill worker (at capacity)");
+                } else {
+                    tracing::error!(error = %e, "Remote prefill failed, failing request");
+                }
                 Err(anyhow::anyhow!(e))
             }
         }

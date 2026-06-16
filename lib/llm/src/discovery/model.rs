@@ -12,9 +12,9 @@ use dashmap::DashMap;
 use rand::Rng;
 use serde::Serialize;
 
+use super::ModelManagerError;
 use super::worker_monitor::LoadThresholdConfig;
 use super::worker_set::WorkerSet;
-use super::{KvWorkerMonitor, ModelManagerError};
 use crate::protocols::openai::ParsingOptions;
 
 use crate::types::{
@@ -604,13 +604,6 @@ impl Model {
             }
         }
         result
-    }
-
-    /// Get the worker monitor for a specific namespace's WorkerSet.
-    pub fn get_worker_monitor_for_namespace(&self, namespace: &str) -> Option<KvWorkerMonitor> {
-        self.worker_sets
-            .get(namespace)
-            .and_then(|entry| entry.value().worker_monitor.clone())
     }
 
     /// Total worker count across all WorkerSets.
