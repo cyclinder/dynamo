@@ -2826,6 +2826,7 @@ dependencies = [
  "clap 4.6.1",
  "dynamo-backend-common",
  "futures",
+ "local-ip-address",
  "prost 0.13.5",
  "prost-types 0.13.5",
  "rand 0.9.4",
