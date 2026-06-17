@@ -5,11 +5,21 @@
 """Power Agent DaemonSet — Phase 1 implementation.
 
 Runs as a privileged DaemonSet (hostPID: true) on each GPU node. Every 15s:
-  1. Lists all pods on this node via the K8s API.
+  1. Lists pods on this node via the K8s API.
   2. For each physical GPU: nvmlDeviceGetComputeRunningProcesses() → PID list.
   3. For each PID: reads /proc/{pid}/cgroup → extracts pod UID.
   4. Looks up the pod's dynamo.nvidia.com/gpu-power-limit annotation.
   5. Calls nvmlDeviceSetPowerManagementLimit(handle, watts × 1000).
+
+Scope is opt-in: the agent only ever caps a GPU whose pod carries the
+dynamo.nvidia.com/gpu-power-limit annotation (set by the planner on
+prefill/decode worker pods). A GPU running only unannotated pods — a
+non-Dynamo workload, or a Dynamo worker not yet annotated — that the agent
+never capped is left at its hardware default and untouched. If the agent had
+previously capped that GPU and the opted-in pod is now gone (a non-managed
+workload reuses it, or the planner removed the annotation), the cap is
+released back to default so it does not strand on the new tenant. See
+``_build_uid_to_annotation`` and ``_release_managed_gpu``.
 
 SIGTERM handler: restores default TDP on all managed GPUs before shutdown.
 Cold-start orphan recovery: UUID-gated (persisted to /var/lib/dynamo-power-agent/).
@@ -379,6 +389,122 @@ def _apply_cap(
             e,
         )
         metrics.apply_failures_total.inc()
+
+
+def _release_managed_gpu(actuator: Actuator, gpu_idx: int) -> None:
+    """Restore default TGP on a GPU we previously capped, and unmanage it.
+
+    Runtime counterpart to ``_handle_sigterm`` / ``_restore_orphaned_gpus_on_startup``.
+    Invoked from steady-state reconcile when a GPU we previously capped is now
+    running only unannotated / non-K8s processes — i.e. the opted-in pod is gone
+    and a non-managed workload owns the GPU (or the planner removed the
+    annotation to release it). Without this, the agent's last cap would strand
+    on the reused GPU until the next agent shutdown (startup orphan recovery
+    skips busy GPUs), silently throttling the new tenant. This implements the
+    "planner owns cap lifecycle via annotation removal/update" contract at
+    runtime.
+
+    Routed through the active ``Actuator`` (not raw ``pynvml``) so the release
+    write flows through the same library that applied the cap. On
+    ``actuator: dcgm`` this means the restore runs ``dcgmConfigSet(default)``,
+    keeping the hostengine's target-config record consistent with the
+    driver-level cap — the same reason ``_handle_sigterm`` was lifted onto the
+    actuator surface in v1.6. Routing it through raw NVML here would desync the
+    DCGM target config on the dcgm path.
+
+    Eligibility is UUID-gated so caps set by other tooling are never touched.
+    A GPU is "ours" if it is in ``_managed_gpu_indices`` (capped in THIS process)
+    OR its UUID is in the persisted ``_previously_managed`` set (capped in a
+    prior process). The latter is essential across restarts: ``_managed_gpu_indices``
+    is in-memory and empty after a restart, while ``_previously_managed`` is
+    loaded from disk — without it, a GPU capped before the restart and now busy
+    with only unannotated work would keep the stale cap (startup orphan recovery
+    only restores *idle* GPUs).
+
+    The idle case (no processes at all) is intentionally NOT handled here;
+    ``_reconcile_gpu``'s ``not pids`` branch keeps the cap for a briefly-exited
+    worker that will return to the same GPU.
+    """
+    try:
+        uuid = actuator.get_uuid(gpu_idx)
+    except Exception as e:
+        logger.warning(
+            "Failed to read UUID for GPU %d during release check: %s", gpu_idx, e
+        )
+        return
+    if gpu_idx not in _managed_gpu_indices and uuid not in _previously_managed:
+        return  # not a GPU this agent capped — leave it alone (UUID-gating)
+
+    # UUID to prune from the persisted set once the release succeeds. On the
+    # ``dcgm`` path a hostengine re-enumeration can move the originally-capped
+    # GPU to a different index, and ``restore_default`` relocates the write by
+    # the recorded UUID (``actuator._resolve_managed_idx``). Pruning by ``uuid``
+    # above — the CURRENT occupant of ``gpu_idx`` — would then drop the wrong
+    # entry and strand the GPU we actually restored in ``managed_gpus.json``.
+    # Mirror ``_handle_sigterm``: prune the originally-managed UUID via
+    # ``managed_uuid_for_idx``. NVML indices are stable within a process, so the
+    # current UUID already matches and the helper is absent there.
+    managed_uuid = uuid
+    if hasattr(type(actuator), "managed_uuid_for_idx"):
+        try:
+            managed_uuid = getattr(actuator, "managed_uuid_for_idx")(gpu_idx)
+        except Exception as e:
+            logger.warning(
+                "Could not resolve managed UUID for GPU %d during release; "
+                "falling back to current UUID for state pruning: %s",
+                gpu_idx,
+                e,
+            )
+
+    try:
+        default_w = actuator.default_w(gpu_idx)
+        current_w = actuator.current_w(gpu_idx)
+        # Attempt the restore when EITHER the current index still shows a live
+        # cap (``current_w < default_w``) OR a dcgm re-enumeration relocated the
+        # GPU we capped to a different index (``managed_uuid != uuid``). The
+        # ``current_w``/``default_w`` probe reads the CURRENT occupant of
+        # ``gpu_idx``; in the relocation case that occupant (``uuid``) can sit
+        # "already at default" while the GPU we actually manage (``managed_uuid``)
+        # is still capped at its new index. Gating solely on
+        # ``current_w < default_w`` would then skip the restore yet still prune
+        # ``managed_uuid`` below, stranding that live cap permanently.
+        # ``restore_default`` relocates by the recorded UUID
+        # (``_resolve_managed_idx``) and is idempotent, so a redundant call when
+        # the managed GPU is already at default is a harmless no-op write.
+        if managed_uuid != uuid or current_w < default_w:
+            # ``restore_default`` returns False when it could not conclusively
+            # locate the managed GPU (e.g. a dcgm re-enumeration it cannot
+            # resolve → ``_resolve_managed_idx`` returns None). The cap is then
+            # still LIVE, so keep our ownership state and let a later reconcile
+            # or the next startup's orphan recovery retry — never prune here, or
+            # we lose the only record that the GPU still needs restoring. This
+            # mirrors ``_handle_sigterm``'s ``is False`` guard.
+            if actuator.restore_default(gpu_idx) is False:
+                logger.warning(
+                    "Skipped cap release for GPU %d via %s actuator (managed "
+                    "GPU not conclusively located); leaving it managed so a "
+                    "later cycle retries.",
+                    gpu_idx,
+                    actuator.name,
+                )
+                return
+            logger.info(
+                "Released cap on GPU %d (managed UUID %s, index observed %d W / "
+                "default %d W): previously managed, now running only "
+                "unannotated/non-K8s processes.",
+                gpu_idx,
+                managed_uuid,
+                current_w,
+                default_w,
+            )
+    except Exception as e:
+        # Leave the GPU in the managed set so a later cycle retries the release.
+        logger.warning("Failed to release cap on GPU %d: %s", gpu_idx, e)
+        return
+    _managed_gpu_indices.discard(gpu_idx)
+    if managed_uuid in _previously_managed:
+        _previously_managed.discard(managed_uuid)
+        _persist_managed_gpus(_previously_managed)
 
 
 # ---------------------------------------------------------------------------
@@ -843,12 +969,34 @@ class PowerAgent:
             return None
 
     def _build_uid_to_annotation(self, pods: list) -> dict[str, Optional[str]]:
-        """Map pod UID → power-limit annotation value (or None if absent/malformed)."""
+        """Map pod UID → power-limit annotation value, for opted-in pods only.
+
+        Scope-by-annotation-key: a pod is in scope **only** if it actually
+        carries ``POWER_ANNOTATION_KEY``. Pods without the key are omitted
+        from the map entirely.
+
+        This omission is load-bearing on shared/multi-tenant nodes.
+        ``_reconcile_gpu`` decides whether a GPU is managed by testing
+        ``uid in uid_to_annotation``; if an unannotated pod were added here
+        with a ``None`` value, a GPU running only that pod would still build a
+        non-empty ``pod_annotations`` and fall through to the "no parseable
+        annotation → safe default" branch in ``_resolve_cap_for_gpu`` — i.e.
+        the agent would silently power-cap a co-located non-Dynamo workload (or
+        a Dynamo worker the planner has not yet annotated). Gating on key
+        presence is what keeps the agent from touching GPUs it was never asked
+        to manage. The planner is the sole writer of this key and stamps it
+        only on prefill/decode worker pods. Do NOT reintroduce unannotated pods
+        with a ``None`` value.
+
+        A pod that carries the key but with a malformed/empty value IS kept
+        (value as-is) so the safe-default fail-safe still applies to a
+        genuinely-managed pod whose annotation is broken.
+        """
         result: dict[str, Optional[str]] = {}
         for pod in pods:
-            uid = pod.metadata.uid
             annotations = pod.metadata.annotations or {}
-            result[uid] = annotations.get(POWER_ANNOTATION_KEY)
+            if POWER_ANNOTATION_KEY in annotations:
+                result[pod.metadata.uid] = annotations[POWER_ANNOTATION_KEY]
         return result
 
     def reconcile_once(self) -> None:
@@ -948,12 +1096,24 @@ class PowerAgent:
                 continue  # non-K8s process — skip
             if uid in seen_uids:
                 continue  # already counted this pod via an earlier PID
-            if uid in uid_to_annotation:
+            if uid in uid_to_annotation:  # opted-in: carries POWER_ANNOTATION_KEY
                 seen_uids.add(uid)
                 pod_annotations.append((uid, uid_to_annotation[uid]))
 
         if not pod_annotations:
-            return  # all processes are non-K8s
+            # No opted-in pod owns this GPU (every process is either non-K8s or
+            # belongs to a pod without POWER_ANNOTATION_KEY). Two sub-cases,
+            # both handled by _release_managed_gpu's UUID-gated eligibility:
+            #   * never managed by us → left at hardware default (the scope
+            #     boundary — see _build_uid_to_annotation).
+            #   * previously managed by us (this process OR a prior one, via the
+            #     persisted UUID set) → the opted-in pod is gone and a
+            #     non-managed workload now runs here, so release our cap rather
+            #     than strand it on the new tenant until shutdown.
+            # The idle case (no processes) is handled by the `not pids` branch
+            # above, which keeps the cap for a briefly-exited worker.
+            _release_managed_gpu(self._actuator, gpu_idx)
+            return
 
         cap_w = _resolve_cap_for_gpu(
             gpu_idx, pod_annotations, self.safe_default_watts, self.metrics
