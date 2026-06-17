@@ -357,10 +357,6 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
     fn get_skip_special_tokens(&self) -> Option<bool> {
         self.common.skip_special_tokens
     }
-
-    fn get_prompt_logprobs_count(&self) -> Option<u32> {
-        self.common.prompt_logprobs
-    }
 }
 
 /// Implements `OpenAIStopConditionsProvider` for `NvCreateChatCompletionRequest`,
@@ -430,8 +426,7 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
     }
 
     fn get_prompt_logprobs(&self) -> Option<u32> {
-        // Top-level `prompt_logprobs` is carried through CommonExt.
-        self.common.prompt_logprobs
+        None
     }
 
     fn get_skip_special_tokens(&self) -> Option<bool> {
