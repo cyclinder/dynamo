@@ -41,7 +41,9 @@ use crate::protocols::anthropic::types::{
     AnthropicErrorBody, AnthropicErrorResponse, SystemContent,
     chat_completion_to_anthropic_response,
 };
-use crate::protocols::common::extensions::{NvExt, validate_nvext_semantics};
+use crate::protocols::common::extensions::{
+    NvExt, apply_header_routing_overrides, validate_nvext_semantics,
+};
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionResponse, NvCreateChatCompletionStreamResponse,
     aggregator::ChatCompletionAggregator,
@@ -177,15 +179,16 @@ async fn handler_anthropic_messages(
     )
     .await;
 
-    let response =
-        tokio::spawn(anthropic_messages(state, template, request, stream_handle).in_current_span())
-            .await
-            .map_err(|e| {
-                anthropic_sanitized_error_with_details(
-                    SanitizedError::Internal,
-                    format!("Failed to await Anthropic messages task: {e:?}"),
-                )
-            })?;
+    let response = tokio::spawn(
+        anthropic_messages(state, template, request, stream_handle, headers).in_current_span(),
+    )
+    .await
+    .map_err(|e| {
+        anthropic_sanitized_error_with_details(
+            SanitizedError::Internal,
+            format!("Failed to await Anthropic messages task: {e:?}"),
+        )
+    })?;
 
     connection_handle.disarm();
     response
@@ -198,6 +201,7 @@ async fn anthropic_messages(
     template: Option<RequestTemplate>,
     mut request: Context<AnthropicCreateMessageRequest>,
     mut stream_handle: ConnectionHandle,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     let streaming = request.stream;
     let request_id = request.id().to_string();
@@ -287,6 +291,9 @@ async fn anthropic_messages(
     // etc.) that the stream converter needs for faithful response reconstruction.
     let anthropic_ctx = unified_request.anthropic_context().cloned();
     let mut chat_request = unified_request.into_inner();
+    if state.nvext_enabled() {
+        chat_request.nvext = apply_header_routing_overrides(chat_request.nvext.take(), &headers);
+    }
     validate_anthropic_nvext(chat_request.nvext.as_ref())?;
 
     // When a reasoning parser is configured and the client hasn't explicitly
