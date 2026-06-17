@@ -256,9 +256,6 @@ impl OpenAIPreprocessor {
             if let Some(ref fields) = nvext.extra_fields {
                 nvext_passthrough.insert("extra_fields".to_string(), serde_json::json!(fields));
             }
-            if let Some(ref salt) = nvext.cache_salt {
-                nvext_passthrough.insert("cache_salt".to_string(), serde_json::json!(salt));
-            }
             if let Some(ref metadata_upload) = nvext.metadata_upload {
                 nvext_passthrough.insert(
                     "metadata_upload".to_string(),
@@ -3200,8 +3197,8 @@ mod tests {
             "detokenize": false,
             "allowed_token_ids": [10, 11],
             "bad_words_token_ids": [[12, 13]],
+            "cache_salt": "step_7",
             "nvext": {
-                "cache_salt": "step_7",
                 "extra_fields": ["completion_token_ids"],
                 "metadata_upload": {
                     "url": "s3://bucket/root/rollouts"
