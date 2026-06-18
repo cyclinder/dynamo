@@ -84,6 +84,88 @@ spec:
 `spec.overrides.dgd` is not required to enable Planner; use it only when the
 generated DGD needs additional customization.
 
+### DGDR with KV-Aware Routing
+
+DGDR does not currently expose a first-class `features.kvRouter` field. To
+configure router behavior on a DGDR-generated deployment, override the generated
+frontend service in `spec.overrides.dgd`.
+
+This example enables approximate KV-aware routing on the generated frontend:
+
+```yaml
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeploymentRequest
+metadata:
+  name: qwen3-kv-router
+spec:
+  model: Qwen/Qwen3-0.6B
+  backend: vllm
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"  # dynamo-frontend for Dynamo < 1.1.0
+  overrides:
+    dgd:
+      apiVersion: nvidia.com/v1alpha1
+      kind: DynamoGraphDeployment
+      spec:
+        services:
+          Frontend:
+            envs:
+              - name: DYN_ROUTER_MODE
+                value: kv
+              - name: DYN_ROUTER_USE_KV_EVENTS
+                value: "false"
+```
+
+Use `DYN_ROUTER_USE_KV_EVENTS=false` when backend workers are not configured to
+publish KV events. For event-driven KV routing, keep the frontend in `kv` mode
+and add the backend-specific KV-event publishing flags to the generated worker
+service. Worker service names depend on the generated topology, so use
+`autoApply: false` first if you need to inspect the generated DGD before
+targeting a specific service override.
+
+For the complete router mode reference, see the
+[Router Guide](../components/router/router-guide.md) and
+[Router Configuration](../components/router/router-configuration.md).
+
+### Planner and Router Together
+
+Planner and router configuration use different DGDR mechanisms:
+
+- Use `spec.features.planner` to enable and configure the generated Planner.
+- Use `spec.overrides.dgd` to customize the generated frontend router settings.
+
+```yaml
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeploymentRequest
+metadata:
+  name: qwen3-planner-kv-router
+spec:
+  model: Qwen/Qwen3-0.6B
+  backend: vllm
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"  # dynamo-frontend for Dynamo < 1.1.0
+  features:
+    planner:
+      mode: disagg
+      backend: vllm
+      optimization_target: throughput
+  overrides:
+    dgd:
+      apiVersion: nvidia.com/v1alpha1
+      kind: DynamoGraphDeployment
+      spec:
+        services:
+          Frontend:
+            envs:
+              - name: DYN_ROUTER_MODE
+                value: kv
+              - name: DYN_ROUTER_USE_KV_EVENTS
+                value: "false"
+```
+
+`spec.overrides.dgd` is merged into the generated DGD after profiling selects a
+configuration. It is useful for frontend/router environment variables, pod
+settings, and other generated-deployment customizations that are not exposed as
+first-class DGDR fields.
+
 ## Additional DGDR Patterns
 
 ### MoE Models (SGLang)
